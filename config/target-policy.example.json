@@ -1,0 +1,31 @@
+{
+  "device-alias": {
+    "account_role": "read-only",
+    "fortios_output_standard_verified": false,
+    "read_inventory": {
+      "interfaces": [
+        "example-interface"
+      ],
+      "services": [
+        "example.service"
+      ],
+      "addresses": [
+        "192.0.2.10"
+      ]
+    },
+    "https_endpoints": [
+      {
+        "path": "/api/v2/monitor/system/status",
+        "port": 443,
+        "use_basic_auth": false
+      }
+    ],
+    "sftp_roots": [
+      "/srv/netops"
+    ],
+    "rate_limit": {
+      "requests": 12,
+      "window_seconds": 60
+    }
+  }
+}
