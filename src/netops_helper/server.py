@@ -11,17 +11,14 @@ from .auth import TargetAuth
 from .engine import (
     dns_probe as engine_dns_probe,
     ftp_list as engine_ftp_list,
-    https_get as engine_https_get,
     icmp_probe as engine_icmp_probe,
-    route_trace as engine_route_trace,
-    sftp_read_text as engine_sftp_read_text,
     sftp_stat as engine_sftp_stat,
     snmp_get as engine_snmp_get,
     ssh_read as engine_ssh_read,
     tcp_probe as engine_tcp_probe,
     tls_probe as engine_tls_probe,
 )
-from .read_policy import public_query_catalog
+from .read_policy import public_query_catalog, public_query_metadata
 
 
 mcp = FastMCP(
@@ -52,19 +49,27 @@ def helper_status() -> dict[str, Any]:
         "device_output_trust": "untrusted",
         "write_tools": [],
         "capabilities": [
-            "DNS/TCP/ICMP/traceroute/TLS/HTTPS diagnostics",
+            "DNS/TCP/ICMP/TLS diagnostics",
             "inventory-bound read-only SSH queries",
             "SNMPv2c GET",
-            "SFTP metadata and paginated text reads",
+            "SFTP metadata",
             "FTPS directory listing; explicitly acknowledged plain FTP for legacy devices",
         ],
     }
 
 
+def _query_catalog_payload() -> dict[str, Any]:
+    return {
+        "ok": True,
+        "queries": public_query_catalog(),
+        "query_metadata": public_query_metadata(),
+    }
+
+
 @mcp.tool
 def read_query_catalog() -> dict[str, Any]:
-    """List public query names and required inventory categories; return no device data."""
-    return {"ok": True, "queries": public_query_catalog()}
+    """List names, informative command templates, and typed metadata without device data."""
+    return _query_catalog_payload()
 
 
 @mcp.tool
@@ -86,12 +91,6 @@ def icmp_probe(target: str, count: int = 4, auth_context: str = "") -> dict[str,
 
 
 @mcp.tool
-def route_trace(target: str, max_hops: int = 20, auth_context: str = "") -> dict[str, Any]:
-    """Trace a route and preserve hop addresses as untrusted diagnostic data."""
-    return engine_route_trace(_auth(target, auth_context), max_hops)
-
-
-@mcp.tool
 def tls_probe(
     target: str,
     port: int = 443,
@@ -100,23 +99,6 @@ def tls_probe(
 ) -> dict[str, Any]:
     """Validate a TLS peer with system trust and preserve certificate identifiers."""
     return engine_tls_probe(_auth(target, auth_context), port, server_name)
-
-
-@mcp.tool
-def https_get(
-    target: str,
-    path: str,
-    port: int = 443,
-    use_basic_auth: bool = False,
-    timeout: float = 15.0,
-    offset: int = 0,
-    max_bytes: int = 24_000,
-    auth_context: str = "",
-) -> dict[str, Any]:
-    """Perform a verified HTTPS GET and return one explicit page of untrusted text."""
-    return engine_https_get(
-        _auth(target, auth_context), path, port, use_basic_auth, timeout, offset, max_bytes,
-    )
 
 
 @mcp.tool
@@ -150,18 +132,6 @@ async def snmp_get(
 async def sftp_stat(target: str, remote_path: str, auth_context: str = "") -> dict[str, Any]:
     """Return SFTP file metadata under a configured read root."""
     return await engine_sftp_stat(_auth(target, auth_context), remote_path)
-
-
-@mcp.tool
-async def sftp_read_text(
-    target: str,
-    remote_path: str,
-    offset: int = 0,
-    max_bytes: int = 24_000,
-    auth_context: str = "",
-) -> dict[str, Any]:
-    """Return one explicit page of an allowlisted UTF-8 file as untrusted data."""
-    return await engine_sftp_read_text(_auth(target, auth_context), remote_path, offset, max_bytes)
 
 
 @mcp.tool

@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+import re
 import threading
 from typing import Any
 
@@ -14,6 +15,27 @@ AUDIT_PATH = Path("/var/lib/netops-helper/audit.jsonl")
 AUDIT_SEGMENT_BYTES = 2_000_000
 AUDIT_RETAINED_SEGMENTS = 5
 _LOCK = threading.Lock()
+_OPERATION_ID = re.compile(r"op_[0-9a-f]{32}")
+
+
+class AuditPersistenceError(RuntimeError):
+    """Base class for typed failures of the mandatory audit boundary."""
+
+    error_code = "audit_persistence"
+
+
+class AuditPreflightError(AuditPersistenceError):
+    """The audit attempt could not be persisted, so the operation did not start."""
+
+    error_code = "audit_preflight_failed"
+    operation_started = False
+
+
+class AuditPostOperationError(AuditPersistenceError):
+    """The operation ran, but its completion record could not be persisted."""
+
+    error_code = "audit_post_operation_failed"
+    operation_started = True
 
 
 def _segment(path: Path, index: int) -> Path:
@@ -42,8 +64,13 @@ def _rotate(path: Path, incoming_bytes: int) -> None:
 
 
 def record(event: str, **fields: Any) -> None:
+    operation_id = fields.get("operation_id")
+    if "operation_id" in fields and (
+        not isinstance(operation_id, str) or _OPERATION_ID.fullmatch(operation_id) is None
+    ):
+        raise ValueError("operation_id has an invalid format")
     allowed = {
-        "target", "status", "query", "platform", "port", "count", "max_hops",
+        "operation_id", "target", "status", "query", "platform", "port", "count", "max_hops",
         "item_count", "offset", "max_bytes", "total_bytes", "returned_bytes",
         "path_sha256", "result_sha256", "use_tls", "use_basic_auth",
         "plaintext_acknowledged", "pagination_source", "detail",

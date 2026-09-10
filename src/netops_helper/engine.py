@@ -2,32 +2,33 @@
 
 from __future__ import annotations
 
-from collections import Counter
 from contextlib import asynccontextmanager, contextmanager
 from functools import wraps
 import inspect
 from datetime import datetime, timezone
 import ftplib
+import ipaddress
 import hashlib
 import hmac
 import json
+import math
 import os
 import tempfile
 from pathlib import Path, PurePosixPath
+import secrets
 import socket
 import threading
 import ssl
 import time
 from typing import Any, Iterator
 
-import httpx
-from icmplib import ping, traceroute
+from icmplib import ping
 from netmiko import ConnectHandler
 from netmiko.fortinet.fortinet_ssh import FortinetSSH
 
-from .audit import record
-from .auth import TargetAuth
-from .read_policy import normalize_platform, render_read_query
+from .audit import AuditPostOperationError, AuditPreflightError, record
+from .auth import EgressScopeError, TargetAuth
+from .read_policy import READ_QUERIES, normalize_platform, render_read_query
 from .sanitize import digest_text, redact
 
 
@@ -36,12 +37,32 @@ _WEAK_SSH_KEX = [
     "diffie-hellman-group14-sha1",
     "diffie-hellman-group-exchange-sha1",
 ]
+_NETMIKO_DEVICE_TYPES = {
+    "linux": "linux",
+    "fortinet": "fortinet",
+    "extreme_exos": "extreme_exos",
+    "cisco_ios": "cisco_ios",
+    "cisco_xe": "cisco_xe",
+    "cisco_nxos": "cisco_nxos",
+    "arista_eos": "arista_eos",
+    "juniper_junos": "juniper_junos",
+    "juniper_junos_els": "juniper_junos",
+}
+if (
+    set(_NETMIKO_DEVICE_TYPES) != set(READ_QUERIES)
+    or _NETMIKO_DEVICE_TYPES.get("fortinet") != "fortinet"
+    or _NETMIKO_DEVICE_TYPES.get("juniper_junos_els") != "juniper_junos"
+    or any(
+        not isinstance(device_type, str) or not device_type
+        for device_type in _NETMIKO_DEVICE_TYPES.values()
+    )
+):
+    raise RuntimeError("Netmiko device-type mapping is incomplete or invalid")
 _SSH_CACHE_TTL_SECONDS = 120.0
 _SSH_CACHE_MAX_ENTRIES = 8
 _SSH_CAPTURE_MAX_BYTES = 2_000_000
 _SSH_PAGE_CACHE: dict[tuple[Any, ...], tuple[float, str]] = {}
 _SSH_CACHE_LOCK = threading.Lock()
-
 
 class ReadOnlyFortinetSSH(FortinetSSH):
     """FortiOS session setup which never enters configuration or changes paging."""
@@ -74,17 +95,43 @@ def _known_hosts_file(auth: TargetAuth) -> Iterator[str]:
             pass
 
 
+def _resolve_target_ipv4(auth: TargetAuth) -> tuple[str, ...]:
+    try:
+        parsed = ipaddress.ip_address(auth.host)
+    except ValueError:
+        auth.require_dns()
+        rows = socket.getaddrinfo(
+            auth.host, None, family=socket.AF_INET, type=socket.SOCK_STREAM,
+        )
+        addresses = tuple(sorted({str(ipaddress.ip_address(row[4][0])) for row in rows}))
+    else:
+        if parsed.version != 4:
+            raise EgressScopeError("only IPv4 target addresses are supported")
+        addresses = (str(parsed),)
+    if not addresses:
+        raise EgressScopeError("target did not resolve to an IPv4 address")
+    if any(not auth.egress.allows_address(address) for address in addresses):
+        raise EgressScopeError("resolved target address is outside the egress allowlist")
+    return addresses
+
 
 @contextmanager
 def netmiko_connection(auth: TargetAuth, platform: str) -> Iterator[Any]:
     normalized = normalize_platform(platform)
+    _resolve_target_ipv4(auth)
     if normalized == "fortinet" and not auth.fortios_output_standard_verified:
         raise ValueError("FortiOS output standard must be independently verified before enrollment")
     with _known_hosts_file(auth) as known_hosts_path:
-        connection_factory = ReadOnlyFortinetSSH if normalized == "fortinet" else ConnectHandler
-        extra = {"disabled_algorithms": {"kex": _WEAK_SSH_KEX}} if normalized == "fortinet" else {}
+        connection_factory = (
+            ReadOnlyFortinetSSH if normalized == "fortinet" else ConnectHandler
+        )
+        extra = (
+            {"disabled_algorithms": {"kex": _WEAK_SSH_KEX}}
+            if normalized == "fortinet"
+            else {}
+        )
         connection = connection_factory(
-            device_type=normalized,
+            device_type=_NETMIKO_DEVICE_TYPES[normalized],
             host=auth.host,
             port=auth.port,
             username=auth.login,
@@ -109,11 +156,36 @@ def _safe_error(exc: Exception, auth: TargetAuth) -> str:
     return redact(f"{type(exc).__name__}: {exc}", auth.secrets)
 
 
+def _bounded_int(value: object, name: str, minimum: int, maximum: int) -> int:
+    if (
+        isinstance(value, bool) or not isinstance(value, int)
+        or not minimum <= value <= maximum
+    ):
+        raise ValueError(f"{name} must be an integer between {minimum} and {maximum}")
+    return value
+
+
+def _bounded_timeout(
+    value: object, name: str, minimum: float, maximum: float,
+) -> float | int:
+    if (
+        isinstance(value, bool) or not isinstance(value, (int, float))
+        or not math.isfinite(value) or not minimum <= value <= maximum
+    ):
+        raise ValueError(f"{name} must be a finite number between {minimum} and {maximum}")
+    return value
+
+
+def _validate_pagination(offset: object, max_bytes: object) -> tuple[int, int]:
+    return (
+        _bounded_int(offset, "offset", 0, 8_000_000),
+        _bounded_int(max_bytes, "max_bytes", 1_000, 48_000),
+    )
+
 
 def _page_text(text: str, offset: int, max_bytes: int) -> dict[str, Any]:
     raw = text.encode("utf-8")
-    offset = int(offset)
-    max_bytes = min(max(int(max_bytes), 1_000), 48_000)
+    offset, max_bytes = _validate_pagination(offset, max_bytes)
     if offset < 0 or offset > len(raw):
         raise ValueError("offset is outside the output")
     try:
@@ -141,20 +213,24 @@ def _audit_fields(arguments: dict[str, Any], result: dict[str, Any]) -> dict[str
         value = arguments.get(name)
         if isinstance(value, int) and not isinstance(value, bool):
             fields[name] = value
-    for name in ("use_tls", "use_basic_auth", "acknowledge_unencrypted"):
+    for name in ("use_tls", "acknowledge_unencrypted"):
         value = arguments.get(name)
         if isinstance(value, bool):
             fields[name if name != "acknowledge_unencrypted" else "plaintext_acknowledged"] = value
     if isinstance(arguments.get("oids"), list):
         fields["item_count"] = len(arguments["oids"])
-    path = arguments.get("remote_path", arguments.get("path"))
+    for name in ("query", "platform"):
+        value = arguments.get(name)
+        if isinstance(value, str):
+            fields[name] = value
+    path = arguments.get("remote_path")
     if isinstance(path, str):
         fields["path_sha256"] = digest_text(path)
     for name in ("query", "platform", "total_bytes", "returned_bytes", "pagination_source"):
         value = result.get(name)
         if isinstance(value, (str, int)) and not isinstance(value, bool):
             fields[name] = value
-    for name in ("content_sha256", "body_sha256", "remote_content_sha256"):
+    for name in ("content_sha256",):
         value = result.get(name)
         if isinstance(value, str):
             fields["result_sha256"] = value
@@ -166,32 +242,78 @@ def _audit_device_call(function: Any) -> Any:
     signature = inspect.signature(function)
     event = function.__name__
 
-    def write(auth: TargetAuth, arguments: dict[str, Any], result: dict[str, Any]) -> None:
-        status = "ok" if result.get("ok") is True else "failed"
-        record(event, target=auth.alias, status=status, **_audit_fields(arguments, result))
+    def preflight(auth: TargetAuth, arguments: dict[str, Any]) -> str:
+        try:
+            operation_id = f"op_{secrets.token_hex(16)}"
+            record(
+                event, operation_id=operation_id, target=auth.alias, status="started",
+                **_audit_fields(arguments, {}),
+            )
+        except Exception as exc:
+            raise AuditPreflightError(
+                "mandatory audit preflight failed; device operation was not started"
+            ) from exc
+        return operation_id
+
+    def complete(
+        auth: TargetAuth,
+        arguments: dict[str, Any],
+        status: str,
+        operation_id: str,
+        result: dict[str, Any] | None = None,
+        detail: str | None = None,
+    ) -> None:
+        fields = _audit_fields(arguments, result or {})
+        if detail is not None:
+            fields["detail"] = detail
+        try:
+            record(
+                event, operation_id=operation_id, target=auth.alias,
+                status=status, **fields,
+            )
+        except Exception as exc:
+            raise AuditPostOperationError(
+                "mandatory audit completion failed after the operation started"
+            ) from exc
 
     if inspect.iscoroutinefunction(function):
         @wraps(function)
         async def async_wrapper(auth: TargetAuth, *args: Any, **kwargs: Any) -> dict[str, Any]:
             bound = signature.bind(auth, *args, **kwargs)
+            arguments = dict(bound.arguments)
+            operation_id = preflight(auth, arguments)
             try:
                 result = await function(auth, *args, **kwargs)
             except Exception as exc:
-                record(event, target=auth.alias, status="rejected", detail=type(exc).__name__)
+                complete(
+                    auth, arguments, "rejected", operation_id,
+                    detail=type(exc).__name__,
+                )
                 raise
-            write(auth, dict(bound.arguments), result)
+            complete(
+                auth, arguments, "ok" if result.get("ok") is True else "failed",
+                operation_id, result,
+            )
             return result
         return async_wrapper
 
     @wraps(function)
     def wrapper(auth: TargetAuth, *args: Any, **kwargs: Any) -> dict[str, Any]:
         bound = signature.bind(auth, *args, **kwargs)
+        arguments = dict(bound.arguments)
+        operation_id = preflight(auth, arguments)
         try:
             result = function(auth, *args, **kwargs)
         except Exception as exc:
-            record(event, target=auth.alias, status="rejected", detail=type(exc).__name__)
+            complete(
+                auth, arguments, "rejected", operation_id,
+                detail=type(exc).__name__,
+            )
             raise
-        write(auth, dict(bound.arguments), result)
+        complete(
+            auth, arguments, "ok" if result.get("ok") is True else "failed",
+            operation_id, result,
+        )
         return result
     return wrapper
 
@@ -232,8 +354,11 @@ def ssh_read(
     offset: int,
     max_bytes: int,
 ) -> dict[str, Any]:
-    normalized, command = render_read_query(platform, query, parameters, auth.read_inventory)
-    offset = int(offset)
+    if not isinstance(platform, str) or not isinstance(query, str):
+        raise ValueError("platform and query must be strings")
+    offset, max_bytes = _validate_pagination(offset, max_bytes)
+    normalized = auth.require_ssh_query(platform, query)
+    normalized, command = render_read_query(normalized, query, parameters, auth.read_inventory)
     cache_key = _ssh_cache_key(auth, normalized, query, parameters)
     pagination_source = "fresh"
     if offset:
@@ -258,7 +383,8 @@ def ssh_read(
             }
     page = _page_text(cleaned, offset, max_bytes)
     if page["next_offset"] is not None:
-        _store_cached_ssh_output(cache_key, cleaned)
+        if offset == 0:
+            _store_cached_ssh_output(cache_key, cleaned)
     else:
         with _SSH_CACHE_LOCK:
             _SSH_PAGE_CACHE.pop(cache_key, None)
@@ -270,31 +396,32 @@ def ssh_read(
 
 @_audit_device_call
 def dns_probe(auth: TargetAuth) -> dict[str, Any]:
+    auth.require_dns()
     started = time.monotonic()
     try:
-        results = socket.getaddrinfo(auth.host, None, type=socket.SOCK_STREAM)
+        addresses = _resolve_target_ipv4(auth)
     except OSError as exc:
         return {"ok": False, "target": auth.alias, "error": _safe_error(exc, auth)}
-    families = Counter("IPv6" if row[0] == socket.AF_INET6 else "IPv4" for row in results)
-    addresses = sorted({str(row[4][0]) for row in results})
     return {
         "ok": True,
         "target": auth.alias,
-        "answers": sum(families.values()),
-        "families": dict(families),
-        "untrusted_device_addresses": addresses,
+        "answers": len(addresses),
+        "families": {"IPv4": len(addresses)},
+        "untrusted_device_addresses": list(addresses),
         "elapsed_ms": round((time.monotonic() - started) * 1000, 1),
     }
 
 
 @_audit_device_call
 def tcp_probe(auth: TargetAuth, port: int, timeout: float) -> dict[str, Any]:
-    if not 1 <= port <= 65535:
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
         raise ValueError("port must be between 1 and 65535")
-    timeout = min(max(float(timeout), 0.2), 15.0)
+    auth.require_tcp_port(port)
+    timeout = _bounded_timeout(timeout, "timeout", 0.2, 15.0)
     started = time.monotonic()
     try:
-        with socket.create_connection((auth.host, port), timeout=timeout):
+        address = _resolve_target_ipv4(auth)[0]
+        with socket.create_connection((address, port), timeout=timeout):
             pass
     except OSError as exc:
         return {
@@ -310,9 +437,11 @@ def tcp_probe(auth: TargetAuth, port: int, timeout: float) -> dict[str, Any]:
 
 @_audit_device_call
 def icmp_probe(auth: TargetAuth, count: int) -> dict[str, Any]:
-    count = min(max(int(count), 1), 8)
+    count = _bounded_int(count, "count", 1, 8)
+    auth.require_icmp()
     try:
-        result = ping(auth.host, count=count, interval=0.2, timeout=2, privileged=False)
+        address = _resolve_target_ipv4(auth)[0]
+        result = ping(address, count=count, interval=0.2, timeout=2, privileged=False)
     except Exception as exc:
         return {"ok": False, "target": auth.alias, "error": _safe_error(exc, auth)}
     return {
@@ -328,44 +457,26 @@ def icmp_probe(auth: TargetAuth, count: int) -> dict[str, Any]:
     }
 
 
-@_audit_device_call
-def route_trace(auth: TargetAuth, max_hops: int) -> dict[str, Any]:
-    max_hops = min(max(int(max_hops), 1), 32)
-    try:
-        hops = traceroute(
-            auth.host, count=1, interval=0.05, timeout=2,
-            max_hops=max_hops, fast=True, privileged=False,
-        )
-    except Exception as exc:
-        return {"ok": False, "target": auth.alias, "error": _safe_error(exc, auth)}
-    return {
-        "ok": bool(hops),
-        "target": auth.alias,
-        "hops": [
-            {
-                "distance": hop.distance,
-                "address": hop.address,
-                "responded": hop.packets_received > 0,
-                "avg_rtt_ms": hop.avg_rtt,
-            }
-            for hop in hops
-        ],
-    }
-
-
 def _name_tuple(entries: tuple[tuple[tuple[str, str], ...], ...]) -> list[dict[str, str]]:
     return [{key: value for key, value in group} for group in entries]
 
 
 @_audit_device_call
 def tls_probe(auth: TargetAuth, port: int, server_name: str | None) -> dict[str, Any]:
-    if not 1 <= port <= 65535:
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
         raise ValueError("port must be between 1 and 65535")
+    if server_name is not None and (
+        not isinstance(server_name, str) or not server_name
+    ):
+        raise ValueError("server_name must be a non-empty string or null")
+    auth.require_tcp_port(port)
+    selected_server_name = auth.require_tls_server_name(server_name)
     context = ssl.create_default_context()
     started = time.monotonic()
     try:
-        with socket.create_connection((auth.host, port), timeout=10) as raw:
-            with context.wrap_socket(raw, server_hostname=server_name or auth.host) as wrapped:
+        address = _resolve_target_ipv4(auth)[0]
+        with socket.create_connection((address, port), timeout=10) as raw:
+            with context.wrap_socket(raw, server_hostname=selected_server_name) as wrapped:
                 cert = wrapped.getpeercert()
                 der = wrapped.getpeercert(binary_form=True)
                 cipher = wrapped.cipher()
@@ -392,61 +503,29 @@ def tls_probe(auth: TargetAuth, port: int, server_name: str | None) -> dict[str,
 
 
 @_audit_device_call
-def https_get(
-    auth: TargetAuth,
-    path: str,
-    port: int,
-    use_basic_auth: bool,
-    timeout: float,
-    offset: int,
-    max_bytes: int,
-) -> dict[str, Any]:
-    if not 1 <= port <= 65535:
-        raise ValueError("port must be between 1 and 65535")
-    path = auth.require_https_endpoint(path, port, use_basic_auth)
-    url = f"https://{auth.host}:{port}{path}"
-    credentials = (auth.login, auth.password) if use_basic_auth else None
-    try:
-        with httpx.Client(verify=True, timeout=min(max(timeout, 1), 30), follow_redirects=False) as client:
-            response = client.get(url, auth=credentials)
-    except Exception as exc:
-        return {"ok": False, "target": auth.alias, "error": _safe_error(exc, auth)}
-    content_type = response.headers.get("content-type", "")
-    body = ""
-    if "text" in content_type or "json" in content_type or not content_type:
-        body = redact(response.text, auth.secrets)
-    page = _page_text(body, offset, max_bytes)
-    page["untrusted_device_body"] = page.pop("untrusted_device_output")
-    return {
-        "ok": response.is_success,
-        "target": auth.alias,
-        "status_code": response.status_code,
-        "content_type": content_type.split(";", 1)[0],
-        "content_length": len(response.content),
-        "body_sha256": hashlib.sha256(response.content).hexdigest(),
-        **page,
-    }
-
-
-@_audit_device_call
 async def snmp_get(auth: TargetAuth, oids: list[str], port: int) -> dict[str, Any]:
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+        raise ValueError("port must be between 1 and 65535")
+    if (
+        not isinstance(oids, list) or not 1 <= len(oids) <= 20
+        or any(not isinstance(oid, str) or not oid or len(oid) > 200 for oid in oids)
+    ):
+        raise ValueError("provide between 1 and 20 bounded string OIDs")
+    community = auth.require_snmp_community()
+    auth.require_udp_port(port)
+    address = _resolve_target_ipv4(auth)[0]
+
     from pysnmp.hlapi.v3arch.asyncio import (
         CommunityData, ContextData, ObjectIdentity, ObjectType, SnmpEngine,
         UdpTransportTarget, get_cmd,
     )
 
-    if not 1 <= port <= 65535:
-        raise ValueError("port must be between 1 and 65535")
-    if not oids or len(oids) > 20:
-        raise ValueError("provide between 1 and 20 OIDs")
-    if any(not oid or len(oid) > 200 for oid in oids):
-        raise ValueError("invalid OID")
     engine = SnmpEngine()
-    transport = await UdpTransportTarget.create((auth.host, port), timeout=2, retries=1)
+    transport = await UdpTransportTarget.create((address, port), timeout=2, retries=1)
     try:
         error_indication, error_status, error_index, var_binds = await get_cmd(
             engine,
-            CommunityData(auth.password, mpModel=1),
+            CommunityData(community, mpModel=1),
             transport,
             ContextData(),
             *(ObjectType(ObjectIdentity(oid)) for oid in oids),
@@ -472,6 +551,7 @@ async def snmp_get(auth: TargetAuth, oids: list[str], port: int) -> dict[str, An
 async def _sftp_client(auth: TargetAuth):
     import asyncssh
 
+    _resolve_target_ipv4(auth)
     with _known_hosts_file(auth) as known_hosts_path:
         async with asyncssh.connect(
             auth.host,
@@ -508,36 +588,15 @@ async def sftp_stat(auth: TargetAuth, remote_path: str) -> dict[str, Any]:
     }
 
 
-@_audit_device_call
-async def sftp_read_text(
-    auth: TargetAuth, remote_path: str, offset: int, max_bytes: int,
-) -> dict[str, Any]:
-    path = _safe_remote_path(auth, remote_path)
-    try:
-        async with _sftp_client(auth) as sftp:
-            attributes = await sftp.stat(path)
-            if int(attributes.size or 0) > 2_000_000:
-                raise ValueError("remote text file exceeds the 2000000-byte safety cap")
-            async with sftp.open(path, "rb") as handle:
-                raw = await handle.read(2_000_001)
-    except Exception as exc:
-        return {"ok": False, "target": auth.alias, "error": _safe_error(exc, auth)}
-    if len(raw) > 2_000_000:
-        return {"ok": False, "target": auth.alias, "error": "remote text file exceeds safety cap"}
-    cleaned = redact(raw.decode("utf-8", "replace"), auth.secrets)
-    page = _page_text(cleaned, offset, max_bytes)
-    page["untrusted_device_content"] = page.pop("untrusted_device_output")
-    return {
-        "ok": True, "target": auth.alias, "path_sha256": digest_text(path),
-        "remote_size": len(raw), "remote_content_sha256": hashlib.sha256(raw).hexdigest(), **page,
-    }
-
-
 def _safe_remote_path(auth: TargetAuth, remote_path: str) -> str:
+    if not isinstance(remote_path, str):
+        raise ValueError("remote path must be a string")
     requested = PurePosixPath(remote_path)
     if (
-        not requested.is_absolute() or "\x00" in remote_path or len(remote_path) > 2_000
+        not requested.is_absolute() or str(requested) != remote_path
+        or remote_path.startswith("//") or len(remote_path) > 2_000
         or ".." in requested.parts
+        or any(ord(char) < 32 or ord(char) == 127 for char in remote_path)
     ):
         raise ValueError("remote path must be an absolute POSIX path")
     path = str(requested)
@@ -588,6 +647,34 @@ def _ftps_context(alias: str) -> tuple[ssl.SSLContext, str | None]:
     return context, digest
 
 
+def _install_ftp_passive_guard(
+    client: ftplib.FTP,
+    auth: TargetAuth,
+    control_address: str,
+) -> None:
+    """Pin passive data connections to the control peer and enrolled TCP ranges."""
+    original_makepasv = client.makepasv
+
+    def guarded_makepasv() -> tuple[str, int]:
+        passive_host, passive_port = original_makepasv()
+        auth.require_passive_tcp_port(passive_port)
+        try:
+            candidate = str(ipaddress.ip_address(passive_host))
+        except ValueError:
+            if passive_host.rstrip(".").lower() != auth.host.rstrip(".").lower():
+                raise EgressScopeError(
+                    "FTP passive host differs from the enrolled control target"
+                )
+            candidate = control_address
+        if candidate != control_address or not auth.egress.allows_address(candidate):
+            raise EgressScopeError(
+                "FTP passive host differs from the enrolled control target"
+            )
+        return control_address, passive_port
+
+    client.makepasv = guarded_makepasv  # type: ignore[method-assign]
+
+
 @_audit_device_call
 def ftp_list(
     auth: TargetAuth,
@@ -596,14 +683,19 @@ def ftp_list(
     port: int,
     acknowledge_unencrypted: bool = False,
 ) -> dict[str, Any]:
-    remote_path = _safe_remote_path(auth, remote_path)
-    if not 1 <= port <= 65535:
+    if not isinstance(use_tls, bool) or not isinstance(acknowledge_unencrypted, bool):
+        raise ValueError("FTP transport flags must be boolean")
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
         raise ValueError("port must be between 1 and 65535")
+    remote_path = _safe_remote_path(auth, remote_path)
     if not use_tls and not acknowledge_unencrypted:
         raise ValueError(
             PLAIN_FTP_WARNING
             + " Set acknowledge_unencrypted=true only after explicit user approval."
         )
+    auth.require_tcp_port(port)
+    auth.require_passive_tcp_range()
+    control_address = _resolve_target_ipv4(auth)[0]
     pin_digest: str | None = None
     security_warning: str | None = None
     if use_tls:
@@ -612,10 +704,12 @@ def ftp_list(
     else:
         security_warning = PLAIN_FTP_WARNING
         client = ftplib.FTP(timeout=30)
+    _install_ftp_passive_guard(client, auth, control_address)
     stage = "connect"
     try:
-        client.connect(auth.host, port)
+        client.connect(control_address, port)
         if isinstance(client, ftplib.FTP_TLS):
+            client.host = auth.host
             stage = "tls_handshake"
             client.auth()
             if pin_digest is not None:
@@ -635,6 +729,12 @@ def ftp_list(
         names = client.nlst(remote_path)
         stage = "quit"
         client.quit()
+    except EgressScopeError:
+        try:
+            client.close()
+        except Exception:
+            pass
+        raise
     except Exception as exc:
         try:
             client.close()

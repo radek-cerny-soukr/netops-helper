@@ -2,7 +2,7 @@
 
 ## Supported versions
 
-Security fixes are maintained for the latest tagged minor release. Pre-1.0 releases may make breaking configuration changes when required to fail closed.
+Security fixes are maintained for the latest tagged minor release. Pre-1.0 releases may make breaking configuration changes when required to fail closed. Version 0.2.0 intentionally rejects legacy target-policy records that omit the mandatory platform, query, or egress contract, and rejects the removed `https_endpoints` key.
 
 ## Reporting a vulnerability
 
@@ -10,22 +10,30 @@ Do not open a public issue for a vulnerability that could expose credentials, de
 
 ## Threats in scope
 
-- Leakage of credentials or private keys.
-- Authentication-context, target-alias, or inventory-scope confusion.
-- SSH host-key bypass.
-- Escape from typed query templates, target inventories, or SFTP read roots.
-- A write-capable tool appearing in the phase-1 MCP server or client profile.
+- Leakage or cross-target injection of credentials, communities, private keys, or host-key inventories.
+- Authentication-context, target-alias, inventory, metadata/listing-root, or egress-scope confusion.
+- SSH host-key bypass or a mutating FortiOS session-preparation command.
+- Escape from typed query templates or SFTP/FTP metadata and listing roots.
+- A write-capable or configuration-reading tool appearing in the phase-1 surface.
 - Prompt injection through device-controlled output.
-- Missing device-operation audit coverage, persistent secret-bearing audit data, or unbounded audit growth.
-- Container privilege or filesystem-hardening regressions.
-- Supply-chain substitution of base images or Python dependencies.
+- Missing mandatory audit coverage, persistent secret-bearing audit data, or unbounded audit growth.
+- Container privilege, filesystem-hardening, or host-firewall regressions.
+- Supply-chain substitution of base images, Python dependencies, or release artifacts.
 
 ## Required deployment boundary
 
 Every target account must be restricted to read-only permissions by the target platform. Local templates and `account_role` enrollment are defense in depth, not substitutes for remote authorization.
 
-Use a dedicated agent/session with no mutating MCP tools, generic shell, write-capable file tools, or deployment integrations. Client-side safety instructions help the model handle untrusted device text, but prompt instructions are not a security boundary.
+Use a dedicated agent/session with no mutating MCP tools, generic shell, write-capable file tools, or deployment integrations. Client-side safety instructions help handle untrusted device text, but prompt instructions are not a security boundary.
+
+Apply and verify an explicit host-firewall egress policy. The generated DOCKER-USER contract restricts forwarded traffic from the stable `nh-egress0` bridge, but it is not full containment and does not govern traffic from that bridge to runner-local services through INPUT. See [Egress control](docs/egress-control.md).
 
 ## Residual risk
 
-Device output remains sensitive and attacker-controlled even after best-effort secret redaction. Plain FTP is unencrypted, and SNMPv2c lacks modern confidentiality. The supported password-backed credential file and `SSH_ASKPASS` environment are compatibility compromises. Client-side path roots do not replace remote permissions or chroot. The standard container network permits diagnostic egress; host-level destination filtering is required if compromise must not expose the wider LAN or Internet. A compromised client, runner, dependency, or target can still return malicious data. No release is certified for a regulatory framework.
+One target record deliberately supplies the same `login` and `password` to SSH, SFTP, FTPS, and plain FTP operations. Plain FTP sends those credentials and listing data without encryption. Use FTPS or a separate least-privilege FTP identity and alias; because `sftp_roots` also authorizes `sftp_stat`, enforce unwanted-protocol denial on the target rather than assuming target policy makes an alias FTP-only.
+
+Device output remains sensitive and attacker-controlled after best-effort redaction. The sanitizer may miss novel secrets or replace legitimate neighboring prose, so secret-bearing sources must be excluded before redaction. Phase 1 deliberately cannot read running/startup/full/backup configurations, generic HTTP response bodies, or remote file contents and cannot browse arbitrary or unbounded device logs, but allowed diagnostics and metadata may still expose operational data.
+
+Plain FTP is unencrypted. SNMPv2c also has no confidentiality and transmits its dedicated community in plaintext. Password-backed credential storage and the askpass environment are compatibility compromises. Client-side path roots do not replace remote permissions or chroot.
+
+The Compose bridge uses `internal: false` so diagnostics work. DOCKER-USER forwarding rules do not by themselves block runner-host INPUT, Docker embedded DNS behavior depends on the live engine/NAT path, and compromise containment therefore remains incomplete until verified and supplemented for the deployment. A compromised client, runner, dependency, or target can still return malicious data. No release is certified for a regulatory framework.

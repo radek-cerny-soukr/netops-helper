@@ -1,14 +1,31 @@
 from __future__ import annotations
 
+from dataclasses import replace
+import ipaddress
+
 import pytest
 
-from netops_helper.auth import TargetAuth
+from netops_helper.auth import EgressPolicy, EgressScopeError, TargetAuth
 import netops_helper.engine as engine
+
+
+TEST_ADDRESS = str(ipaddress.IPv4Address((192 << 24) | (2 << 8) | 30))
 
 
 def target_auth() -> TargetAuth:
     return TargetAuth(
-        "legacy-device", "host.invalid", 21, "account", "credential", "public-key", ("/safe",),
+        alias="legacy-device",
+        host=TEST_ADDRESS,
+        port=21,
+        login="account",
+        password="credential",
+        known_hosts="public-key",
+        sftp_roots=("/safe",),
+        egress=EgressPolicy(
+            addresses=(TEST_ADDRESS,),
+            tcp_ports=(21,),
+            tcp_port_ranges=((50_000, 50_010),),
+        ),
     )
 
 
@@ -33,8 +50,12 @@ class FakePlainFTP:
         self.closed = False
 
     def connect(self, host: str, port: int) -> None:
-        assert host == "host.invalid" and port == 21
+        assert host == TEST_ADDRESS and port == 21
+        self.control_host = host
         self.connected = True
+
+    def makepasv(self) -> tuple[str, int]:
+        return self.control_host, 50_005
 
     def login(self, login: str, password: str) -> None:
         assert self.connected
@@ -43,6 +64,8 @@ class FakePlainFTP:
 
     def nlst(self, remote_path: str) -> list[str]:
         assert self.logged_in and remote_path == "/safe"
+        passive_host, passive_port = self.makepasv()
+        assert passive_host == TEST_ADDRESS and passive_port == 50_005
         return ["/safe-file.txt"]
 
     def quit(self) -> None:
@@ -70,3 +93,39 @@ def test_acknowledged_plain_ftp_returns_permanent_unencrypted_warning(
     assert "credentials" in result["security_warning"].lower()
     assert "directory listing" in result["security_warning"].lower()
     assert result["entries"] == ["safe-file.txt"]
+
+def test_ftp_requires_passive_range_before_client_creation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = target_auth()
+    target = replace(
+        target,
+        egress=replace(target.egress, tcp_port_ranges=()),
+    )
+    monkeypatch.setattr(
+        engine.ftplib, "FTP",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("FTP client must not be created")
+        ),
+    )
+    monkeypatch.setattr(engine, "record", lambda *args, **kwargs: None)
+    with pytest.raises(EgressScopeError, match="passive TCP port range"):
+        engine.ftp_list(
+            target, "/safe", use_tls=False, port=21, acknowledge_unencrypted=True,
+        )
+
+
+def test_ftp_rejects_server_selected_passive_port_outside_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class OutOfScopePassiveFTP(FakePlainFTP):
+        def makepasv(self) -> tuple[str, int]:
+            return self.control_host, 50_011
+
+    monkeypatch.setattr(engine.ftplib, "FTP", OutOfScopePassiveFTP)
+    monkeypatch.setattr(engine, "record", lambda *args, **kwargs: None)
+    with pytest.raises(EgressScopeError, match="passive port"):
+        engine.ftp_list(
+            target_auth(), "/safe", use_tls=False, port=21,
+            acknowledge_unencrypted=True,
+        )

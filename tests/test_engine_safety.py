@@ -1,18 +1,48 @@
 from __future__ import annotations
 
+import asyncio
 from contextlib import contextmanager
+from dataclasses import replace
+import ipaddress
+import re
+import sys
+import types
 
 import pytest
 
-from netops_helper.auth import TargetAuth
+from netops_helper.audit import AuditPostOperationError, AuditPreflightError
+from netops_helper.auth import (
+    AuthenticationMaterialError, EgressPolicy, EgressScopeError,
+    PolicyScopeError, TargetAuth,
+)
 import netops_helper.engine as engine
+from netops_helper.read_policy import READ_QUERIES
+
+
+TEST_ADDRESS = str(ipaddress.IPv4Address((192 << 24) | (2 << 8) | 20))
 
 
 def auth(*, fortios_verified: bool = True) -> TargetAuth:
     return TargetAuth(
-        "device-a", "host.invalid", 22, "reader", "credential", "known-key",
-        ("/safe",), (("/status", 443, False),), {"interfaces": ("port3",)}, "read-only",
-        fortios_verified,
+        alias="device-a",
+        host=TEST_ADDRESS,
+        port=22,
+        login="reader",
+        password="credential",
+        known_hosts="known-key",
+        sftp_roots=("/safe",),
+        read_inventory={"interfaces": ("port3",)},
+        account_role="read-only",
+        fortios_output_standard_verified=fortios_verified,
+        ssh_platform="fortinet",
+        enabled_queries=("interface_details",),
+        egress=EgressPolicy(
+            addresses=(TEST_ADDRESS,),
+            tcp_ports=(21, 443),
+            udp_ports=(161,),
+            tcp_port_ranges=((50_000, 50_010),),
+            allow_icmp=True,
+        ),
     )
 
 
@@ -26,10 +56,61 @@ def test_fortios_connection_uses_read_only_driver_and_disables_sha1_kex(monkeypa
             captured["disconnected"] = True
 
     monkeypatch.setattr(engine, "ReadOnlyFortinetSSH", FakeConnection)
+    monkeypatch.setattr(
+        engine,
+        "ConnectHandler",
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("Fortinet must use the read-only connection class")
+        ),
+    )
     with engine.netmiko_connection(auth(), "fortios"):
         pass
+    assert captured["device_type"] == "fortinet"
     assert captured["disabled_algorithms"]["kex"] == engine._WEAK_SSH_KEX
     assert all(name.endswith("sha1") for name in engine._WEAK_SSH_KEX)
+    assert captured["disconnected"] is True
+
+
+def test_netmiko_device_type_map_matches_canonical_authority() -> None:
+    assert set(engine._NETMIKO_DEVICE_TYPES) == set(READ_QUERIES)
+    assert all(
+        isinstance(device_type, str) and device_type
+        for device_type in engine._NETMIKO_DEVICE_TYPES.values()
+    )
+    assert engine._NETMIKO_DEVICE_TYPES["fortinet"] == "fortinet"
+    assert engine._NETMIKO_DEVICE_TYPES["juniper_junos_els"] == "juniper_junos"
+
+
+@pytest.mark.parametrize(
+    ("platform", "expected_device_type"),
+    (
+        ("linux", "linux"),
+        ("extreme_exos", "extreme_exos"),
+        ("cisco_ios", "cisco_ios"),
+        ("cisco_xe", "cisco_xe"),
+        ("cisco_nxos", "cisco_nxos"),
+        ("arista_eos", "arista_eos"),
+        ("juniper_junos", "juniper_junos"),
+        ("juniper_junos_els", "juniper_junos"),
+    ),
+)
+def test_canonical_platform_uses_expected_netmiko_device_type(
+    monkeypatch, platform, expected_device_type,
+) -> None:
+    captured = {}
+
+    class FakeConnection:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def disconnect(self):
+            captured["disconnected"] = True
+
+    monkeypatch.setattr(engine, "ConnectHandler", FakeConnection)
+    with engine.netmiko_connection(auth(), platform):
+        pass
+    assert captured["device_type"] == expected_device_type
+    assert "disabled_algorithms" not in captured
     assert captured["disconnected"] is True
 
 
@@ -70,15 +151,300 @@ def test_ssh_continuation_uses_cache_without_second_login(monkeypatch) -> None:
 
 def test_every_device_function_has_audit_wrapper() -> None:
     names = (
-        "dns_probe", "tcp_probe", "icmp_probe", "route_trace", "tls_probe", "https_get",
-        "ssh_read", "snmp_get", "sftp_stat", "sftp_read_text", "ftp_list",
+        "dns_probe", "tcp_probe", "icmp_probe", "tls_probe",
+        "ssh_read", "snmp_get", "sftp_stat", "ftp_list",
     )
     assert all(hasattr(getattr(engine, name), "__wrapped__") for name in names)
 
 
-def test_https_and_ftp_paths_fail_closed(monkeypatch) -> None:
+def test_generic_body_read_functions_are_absent_from_phase1_engine() -> None:
+    for name in ("https_get", "sftp_read_text", "_read_https_snapshot", "_read_sftp_snapshot"):
+        assert not hasattr(engine, name)
+
+
+def test_route_trace_is_absent_from_phase1_engine() -> None:
+    assert not hasattr(engine, "route_trace")
+
+
+def test_ssh_query_policy_rejects_before_connection_with_audit_names(monkeypatch) -> None:
+    events = []
+    monkeypatch.setattr(
+        engine, "record",
+        lambda event, **kwargs: events.append({"event": event, **kwargs}),
+    )
+    monkeypatch.setattr(
+        engine, "netmiko_connection",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("SSH connection must not open")
+        ),
+    )
+    with pytest.raises(PolicyScopeError):
+        engine.ssh_read(auth(), "fortios", "routing_table", None, 0, 1000)
+    assert [(item["status"], item["platform"], item["query"]) for item in events] == [
+        ("started", "fortios", "routing_table"),
+        ("rejected", "fortios", "routing_table"),
+    ]
+    assert all("parameters" not in item and "path" not in item for item in events)
+
+
+def test_public_argument_types_fail_before_transport(monkeypatch) -> None:
+    monkeypatch.setattr(engine, "record", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        engine, "_resolve_target_ipv4",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("transport resolution must not start")
+        ),
+    )
+    target = replace(auth(), snmp_community="snmp-secret")
+    calls = (
+        lambda: engine.tcp_probe(target, 443, True),
+        lambda: engine.tcp_probe(target, 443, float("nan")),
+        lambda: engine.icmp_probe(target, "4"),
+        lambda: engine.tls_probe(target, 443, 7),
+        lambda: engine.ssh_read(
+            target, "fortios", "interface_details", {"interface": 3}, 0, 1000,
+        ),
+        lambda: asyncio.run(engine.snmp_get(target, ("1.3.6",), 161)),
+        lambda: asyncio.run(engine.sftp_stat(target, "/safe//log")),
+        lambda: engine.ftp_list(target, "/safe", 1, 21, False),
+    )
+    for call in calls:
+        with pytest.raises(ValueError):
+            call()
+
+
+def test_tcp_scope_rejects_before_socket(monkeypatch) -> None:
+    monkeypatch.setattr(engine, "record", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        engine.socket, "create_connection",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("socket must not open")
+        ),
+    )
+    with pytest.raises(EgressScopeError):
+        engine.tcp_probe(auth(), 444, 1)
+
+
+def test_tls_name_scope_rejects_before_socket(monkeypatch) -> None:
+    monkeypatch.setattr(engine, "record", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        engine.socket, "create_connection",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("socket must not open")
+        ),
+    )
+    with pytest.raises(EgressScopeError):
+        engine.tls_probe(auth(), 443, "other.invalid")
+
+
+def test_protocol_flags_reject_before_transport(monkeypatch) -> None:
+    monkeypatch.setattr(engine, "record", lambda *args, **kwargs: None)
+    target = auth()
+    denied = replace(
+        target,
+        egress=replace(target.egress, allow_dns=False, allow_icmp=False),
+    )
+    monkeypatch.setattr(
+        engine.socket, "getaddrinfo",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("DNS must not start")
+        ),
+    )
+    monkeypatch.setattr(
+        engine, "ping",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("ICMP must not start")
+        ),
+    )
+    with pytest.raises(EgressScopeError):
+        engine.dns_probe(denied)
+    with pytest.raises(EgressScopeError):
+        engine.icmp_probe(denied, 1)
+
+
+def test_snmp_udp_scope_rejects_before_backend_import(monkeypatch) -> None:
+    monkeypatch.setattr(engine, "record", lambda *args, **kwargs: None)
+    target = replace(auth(), snmp_community="snmp-secret")
+    with pytest.raises(EgressScopeError):
+        asyncio.run(engine.snmp_get(target, ["1.3.6"], 162))
+
+
+def test_ftp_paths_fail_closed(monkeypatch) -> None:
     monkeypatch.setattr(engine, "record", lambda *args, **kwargs: None)
     with pytest.raises(ValueError):
         engine.ftp_list(auth(), "/outside", True, 21)
-    with pytest.raises(Exception, match="HTTPS endpoint"):
-        engine.https_get(auth(), "/action?reboot=1", 443, True, 5, 0, 1000)
+
+
+def test_audit_preflight_failure_prevents_operation(monkeypatch) -> None:
+    touched = []
+
+    @engine._audit_device_call
+    def fake_device_call(target_auth):
+        touched.append(True)
+        return {"ok": True}
+
+    monkeypatch.setattr(
+        engine, "record",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("audit unavailable")),
+    )
+    with pytest.raises(AuditPreflightError) as captured:
+        fake_device_call(auth())
+    assert captured.value.operation_started is False
+    assert touched == []
+
+
+def test_operation_id_generation_failure_is_typed_preflight(monkeypatch) -> None:
+    touched = []
+
+    @engine._audit_device_call
+    def fake_device_call(target_auth):
+        touched.append(True)
+        return {"ok": True}
+
+    monkeypatch.setattr(
+        engine.secrets, "token_hex",
+        lambda *args: (_ for _ in ()).throw(OSError("random source unavailable")),
+    )
+    with pytest.raises(AuditPreflightError) as captured:
+        fake_device_call(auth())
+    assert captured.value.operation_started is False
+    assert touched == []
+
+
+def test_audit_completion_failure_is_explicit_after_operation(monkeypatch) -> None:
+    touched = []
+    statuses = []
+
+    @engine._audit_device_call
+    def fake_device_call(target_auth):
+        touched.append(True)
+        return {"ok": True}
+
+    def record_then_fail(*args, **kwargs):
+        statuses.append(kwargs["status"])
+        if len(statuses) == 2:
+            raise OSError("audit unavailable")
+
+    monkeypatch.setattr(engine, "record", record_then_fail)
+    with pytest.raises(AuditPostOperationError) as captured:
+        fake_device_call(auth())
+    assert captured.value.operation_started is True
+    assert touched == [True]
+    assert statuses == ["started", "ok"]
+
+
+def test_async_audit_records_started_and_rejected(monkeypatch) -> None:
+    statuses = []
+
+    @engine._audit_device_call
+    async def fake_device_call(target_auth):
+        raise ValueError("rejected")
+
+    monkeypatch.setattr(
+        engine, "record",
+        lambda *args, **kwargs: statuses.append((
+            kwargs["status"], kwargs.get("detail"), kwargs["operation_id"],
+        )),
+    )
+    with pytest.raises(ValueError, match="rejected"):
+        asyncio.run(fake_device_call(auth()))
+    assert [(status, detail) for status, detail, _ in statuses] == [
+        ("started", None), ("rejected", "ValueError"),
+    ]
+    assert statuses[0][2] == statuses[1][2]
+    assert re.fullmatch(r"op_[0-9a-f]{32}", statuses[0][2])
+
+
+def test_interleaved_audit_calls_have_unique_pairable_operation_ids(monkeypatch) -> None:
+    events = []
+    entered = []
+    release = asyncio.Event()
+
+    @engine._audit_device_call
+    async def fake_device_call(target_auth, marker):
+        entered.append(marker)
+        if len(entered) == 8:
+            release.set()
+        await release.wait()
+        await asyncio.sleep(0)
+        return {"ok": True}
+
+    monkeypatch.setattr(
+        engine, "record",
+        lambda event, **kwargs: events.append({"event": event, **kwargs}),
+    )
+
+    async def scenario():
+        return await asyncio.gather(*(
+            fake_device_call(auth(), f"secret-marker-{index}")
+            for index in range(8)
+        ))
+
+    results = asyncio.run(scenario())
+    assert all(result == {"ok": True} for result in results)
+    assert len(events) == 16
+
+    grouped = {}
+    for event in events:
+        operation_id = event["operation_id"]
+        assert re.fullmatch(r"op_[0-9a-f]{32}", operation_id)
+        grouped.setdefault(operation_id, []).append(event["status"])
+        assert "marker" not in event
+        assert "secret-marker" not in operation_id
+    assert len(grouped) == 8
+    assert all(statuses == ["started", "ok"] for statuses in grouped.values())
+
+
+def test_snmp_requires_separate_community_before_backend_import(monkeypatch) -> None:
+    monkeypatch.setattr(engine, "record", lambda *args, **kwargs: None)
+    with pytest.raises(AuthenticationMaterialError) as captured:
+        asyncio.run(engine.snmp_get(auth(), ["1.3.6"], 161))
+    assert captured.value.error_code == "auth_material"
+
+
+def test_snmp_backend_receives_only_the_separate_community(monkeypatch) -> None:
+    captured = {}
+
+    class CommunityData:
+        def __init__(self, value, mpModel):
+            captured["community"] = value
+            captured["model"] = mpModel
+
+    class Transport:
+        @classmethod
+        async def create(cls, *args, **kwargs):
+            captured["transport_created"] = True
+            return object()
+
+    class Engine:
+        def close_dispatcher(self):
+            captured["closed"] = True
+
+    class Placeholder:
+        def __init__(self, *args):
+            pass
+
+    async def get_cmd(*args, **kwargs):
+        return None, False, 0, []
+
+    backend = types.ModuleType("pysnmp.hlapi.v3arch.asyncio")
+    backend.CommunityData = CommunityData
+    backend.ContextData = Placeholder
+    backend.ObjectIdentity = Placeholder
+    backend.ObjectType = Placeholder
+    backend.SnmpEngine = Engine
+    backend.UdpTransportTarget = Transport
+    backend.get_cmd = get_cmd
+    monkeypatch.setitem(sys.modules, "pysnmp.hlapi.v3arch.asyncio", backend)
+    monkeypatch.setattr(engine, "record", lambda *args, **kwargs: None)
+    target_auth = replace(
+        auth(), password="ssh-secret", snmp_community="snmp-secret",
+    )
+    result = asyncio.run(engine.snmp_get(target_auth, ["1.3.6"], 161))
+    assert result["ok"] is True
+    assert captured == {
+        "community": "snmp-secret",
+        "model": 1,
+        "transport_created": True,
+        "closed": True,
+    }

@@ -27,8 +27,8 @@ jobs:
 
       - name: Run offline verification
         run: |
-          python -m pytest -q
           PYTHONPATH=src python tests/run_tests.py
+          NETOPS_REQUIRE_RUNTIME_TESTS=1 python -m pytest -q
           python scripts/generate_sbom.py
           git diff --exit-code -- sbom.cdx.json
           python scripts/check_public_release.py

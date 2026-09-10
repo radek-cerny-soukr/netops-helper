@@ -3,7 +3,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: local/netops-helper:0.1.0
+    image: local/netops-helper:0.2.0
     container_name: netops-helper
     restart: unless-stopped
     read_only: true
@@ -28,6 +28,9 @@ networks:
   netops-helper:
     name: netops-helper
     driver: bridge
+    enable_ipv6: false
+    driver_opts:
+      com.docker.network.bridge.name: nh-egress0
     internal: false
 
 volumes:

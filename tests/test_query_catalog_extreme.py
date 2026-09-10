@@ -1,0 +1,161 @@
+#!/usr/bin/env python3
+"""Dependency-free contract tests for the Extreme query catalogue."""
+
+from __future__ import annotations
+
+import re
+
+from netops_helper.query_catalog.extreme import QUERIES
+from netops_helper.query_catalog.model import Query
+
+
+# Exact volume rationale: history and process output, device-wide port, neighbor,
+# forwarding, and VLAN tables, scoped ARP and FDB tables, and global LAG, LACP,
+# and STP instance lists can need continuation. Single-port details stay False.
+EXPECTED = {
+    "switch": ("show switch", (), False),
+    "version": ("show version", (), False),
+    "memory": ("show memory", (), False),
+    "cpu_monitoring": ("show cpu-monitoring", (), True),
+    "processes": ("show process", (), True),
+    "diagnostics": ("show diagnostics", (), False),
+    "temperature": ("show temperature", (), False),
+    "fans": ("show fans", (), False),
+    "power": ("show power", (), False),
+    "ports": ("show ports no-refresh", (), True),
+    "ports_configuration": (
+        "show ports configuration no-refresh",
+        (),
+        True,
+    ),
+    "interface_details": (
+        "show port {interface} information detail",
+        (("interface", "interfaces", "extreme_physical_port"),),
+        False,
+    ),
+    "interface_statistics": (
+        "show ports {interface} statistics no-refresh",
+        (("interface", "interfaces", "extreme_physical_port"),),
+        False,
+    ),
+    "interface_rx_errors": (
+        "show ports {interface} rxerrors no-refresh",
+        (("interface", "interfaces", "extreme_physical_port"),),
+        False,
+    ),
+    "interface_tx_errors": (
+        "show ports {interface} txerrors no-refresh",
+        (("interface", "interfaces", "extreme_physical_port"),),
+        False,
+    ),
+    "interface_transceiver": (
+        "show ports {interface} transceiver information detail",
+        (("interface", "interfaces", "extreme_physical_port"),),
+        False,
+    ),
+    "route_summary": ("show iproute summary", (), False),
+    "ipv6_route_summary": ("show iproute ipv6 summary", (), False),
+    "arp_table": ("show iparp", (), True),
+    "arp_address": (
+        "show iparp {address}",
+        (("address", "addresses", "ipv4_address"),),
+        False,
+    ),
+    "arp_interface": (
+        "show iparp port {interface}",
+        (("interface", "interfaces", "extreme_physical_port"),),
+        True,
+    ),
+    "ipv6_neighbors": ("show neighbor-discovery cache ipv6", (), True),
+    "ipv6_neighbor_address": (
+        "show neighbor-discovery cache ipv6 {address}",
+        (("address", "addresses", "ipv6_address"),),
+        False,
+    ),
+    "mac_table": ("show fdb", (), True),
+    "mac_interface": (
+        "show fdb ports {interface}",
+        (("interface", "interfaces", "extreme_physical_port"),),
+        True,
+    ),
+    "lldp_neighbors": ("show lldp neighbors", (), True),
+    "lldp_interface": (
+        "show lldp port {interface} neighbors",
+        (("interface", "interfaces", "extreme_physical_port"),),
+        False,
+    ),
+    "lldp_interface_details": (
+        "show lldp port {interface} neighbors detailed",
+        (("interface", "interfaces", "extreme_physical_port"),),
+        False,
+    ),
+    "vlan_summary": ("show vlan", (), True),
+    "sharing": ("show sharing", (), True),
+    "lacp": ("show lacp", (), True),
+    "stp_summary": ("show stpd", (), True),
+}
+
+CONTROL_OR_SHELL = re.compile(r"[\x00-\x1f\x7f;&|$<>\x60]")
+FORBIDDEN_TERMS = (
+    "show configuration",
+    "show config",
+    " log",
+    "tech-support",
+    "debug",
+    "clear",
+    "reset",
+    "restart",
+)
+
+
+def _slots(query: Query) -> tuple[tuple[str, str, str], ...]:
+    return tuple(
+        sorted(
+            (name, slot.inventory, slot.kind)
+            for name, slot in query.slots.items()
+        )
+    )
+
+
+def test_exact_catalogue_contract() -> None:
+    actual = {
+        name: (query.command, _slots(query), query.high_volume)
+        for name, query in QUERIES.items()
+    }
+    assert actual == EXPECTED
+    assert all(isinstance(query, Query) for query in QUERIES.values())
+
+
+def test_commands_are_narrow_read_only_cli() -> None:
+    for query in QUERIES.values():
+        command = query.command
+        assert command.startswith("show ")
+        assert CONTROL_OR_SHELL.search(command) is None
+        assert "\\" not in command
+        lowered = command.lower()
+        assert not any(term in lowered for term in FORBIDDEN_TERMS)
+
+
+def test_vlan_summary_has_no_inventory_slot() -> None:
+    query = QUERIES["vlan_summary"]
+    assert query.command == "show vlan"
+    assert _slots(query) == ()
+
+
+def test_descriptions_are_present_and_ascii() -> None:
+    for query in QUERIES.values():
+        assert query.description
+        assert query.description.endswith(".")
+        query.description.encode("ascii")
+
+
+def main() -> None:
+    test_exact_catalogue_contract()
+    test_commands_are_narrow_read_only_cli()
+    test_vlan_summary_has_no_inventory_slot()
+    test_descriptions_are_present_and_ascii()
+    print("extreme query catalogue tests: ok")
+
+
+if __name__ == "__main__":
+    main()

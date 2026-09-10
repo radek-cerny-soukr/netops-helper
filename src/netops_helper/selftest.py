@@ -13,9 +13,12 @@ def main() -> int:
     import pysnmp  # noqa: F401
 
     trust_paths = ssl.get_default_verify_paths()
-    assert trust_paths.cafile and Path(trust_paths.cafile).is_file()
-    assert ssl.create_default_context().get_ca_certs(binary_form=True)
-    assert Path("/var/lib/netops-helper").is_dir()
+    if not trust_paths.cafile or not Path(trust_paths.cafile).is_file():
+        return 1
+    if not ssl.create_default_context().get_ca_certs(binary_form=True):
+        return 1
+    if not Path("/var/lib/netops-helper").is_dir():
+        return 1
     return 0
 
 

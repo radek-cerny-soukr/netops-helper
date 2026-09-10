@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import stat
+import tempfile as temporary_directory
 
 import netops_helper.audit as audit
 
@@ -48,3 +49,51 @@ def test_audit_rejects_record_larger_than_segment(tmp_path: Path, monkeypatch) -
         assert "segment limit" in str(exc)
     else:
         raise AssertionError("oversized audit record was accepted")
+
+def _assert_operation_id_contract(path: Path) -> None:
+    previous = audit.AUDIT_PATH
+    audit.AUDIT_PATH = path
+    try:
+        operation_id = "op_" + "a" * 32
+        audit.record(
+            "ssh_read", operation_id=operation_id,
+            target="device-a", status="started",
+        )
+        payload = json.loads(path.read_text())
+        assert payload["operation_id"] == operation_id
+
+        invalid = (
+            None,
+            7,
+            "",
+            "a" * 32,
+            "op_" + "A" * 32,
+            "op_" + "a" * 31,
+            "op_" + "a" * 33,
+            "op_" + "../secret-input",
+        )
+        for value in invalid:
+            try:
+                audit.record("ssh_read", operation_id=value, status="started")
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"invalid operation_id was accepted: {value!r}")
+        assert len(path.read_text().splitlines()) == 1
+    finally:
+        audit.AUDIT_PATH = previous
+
+
+def test_audit_operation_id_has_exact_allowlisted_format(tmp_path: Path) -> None:
+    _assert_operation_id_contract(tmp_path / "operation-id.jsonl")
+
+
+def main() -> int:
+    with temporary_directory.TemporaryDirectory() as raw:
+        _assert_operation_id_contract(Path(raw) / "operation-id.jsonl")
+    print("audit_contract_tests=passed")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

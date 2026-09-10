@@ -1,37 +1,62 @@
 # Release process
 
-Official releases are built locally on a trusted Raspberry Pi ARM64 host from a clean, signed
-commit. GitHub-hosted CI performs portable source checks only; it is not the release builder.
+Official releases are built on an isolated, trusted Linux ARM64 builder from a clean, signed commit. Hosted CI performs portable source checks only; it is not the release builder.
 
-Never publish the surrounding private workspace, environment-specific certificates, reports, live
-tests, credentials, host keys, local policy, or deployment scripts. The release export is a positive
-allowlist and deliberately excludes maintainer notes and internal review material.
+Never publish surrounding private project context, environment-specific certificates, generated firewall bundles, live reports, credentials, host keys, deployment policy, or deployment scripts. The release export is a positive allowlist.
 
-1. Review every source change. Ensure the version agrees in `pyproject.toml`,
-   changelog, and release tooling.
-2. Regenerate both Python 3.12 hash locks with the reviewed `pip-tools` version, regenerate the
-   CycloneDX dependency SBOM, and review the complete dependency/license diff.
-3. In the isolated local builder, install `requirements-release.lock` with `--require-hashes`.
-   Run pytest, dependency-free security tests, SBOM comparison, and
-   `scripts/check_public_release.py`.
-4. Create the allowlisted source tree with `scripts/create_release_artifacts.py`. The trusted host
-   runs Docker Buildx only on this export; the release toolbox must not mount the host Docker socket.
-5. Record the ARM64 OCI image digest, generate an image SBOM, scan it with a current vulnerability
-   database, and stop the release on unreviewed critical findings. Exact reviewed exceptions and
-   their residual risk are disclosed in [Known vulnerability findings](known-vulnerabilities.md).
-6. Recreate the source export with the image digest, produce a deterministic source archive, and
-   generate one SHA-256 manifest covering every published artifact.
-7. Sign the commit and annotated Git tag, then sign the checksum manifest with Sigstore/cosign.
-8. Push only the clean public repository and signed tag. Create a draft GitHub release and attach
-   the source archive, ARM64 OCI archive, manifests, SBOMs, scan report, digest, checksums, and
-   signature bundle.
-9. Independently verify the draft and its signature before publishing it.
+1. Review every source change and freeze the release metadata, including the actual release date. Ensure version 0.2.0 agrees in `pyproject.toml`, `src/netops_helper/__init__.py`, release tooling, Compose image label, SBOM metadata, and changelog. Any later source, release-date, test, ignore-rule, or release-tool change requires a new commit and a complete repeat of the remaining procedure.
+2. Decide whether dependency inputs changed. For an application-code/version-only release, keep both Python 3.12 hash lockfiles byte-identical. If `requirements.txt`, `requirements-release.in`, a dependency, index policy, Python baseline, or lock generator changes, first pin and record the exact reviewed generator environment, then regenerate both locks and review the complete dependency/license diff. The current lock headers identify `pip-compile` and Python 3.12 but do not encode a `pip-tools` version, so do not claim a reproducible regeneration until that tool version is explicitly pinned.
+3. Run the portable dependency-free contracts, regenerate the committed CycloneDX dependency SBOM, require a byte-clean SBOM result, run the public release gate, and inspect an allowlisted source export:
 
-The maintained image for 0.1.0 is Linux ARM64. Cross-building amd64 is intentionally excluded
-because it would require privileged host-level binfmt/QEMU setup. Users on other architectures can
-review and build the source themselves, but those builds are outside the official verification
-claim.
+   ```bash
+   PYTHONPATH=src python tests/run_tests.py
+   python scripts/generate_sbom.py
+   git diff --exit-code -- sbom.cdx.json
+   python scripts/check_public_release.py
+   python scripts/create_release_artifacts.py --output path/to/new-output
+   ```
 
-Changing an image digest, locked dependency, snapshot date, or release tool is a reviewed source
-change. Pinning improves repeatability; it does not prove safety, so vulnerability, license, and
-residual-risk review remain mandatory.
+   The export destination must not already exist. Review the complete diff and exported tree before signing.
+4. Create the final trusted signed commit on clean `main`. Verify its signature against the release trust root, its exact object ID, the canonical origin, the absence of replace refs, and a clean tracked and untracked status. Do not create a tag or perform any public write as part of the commit operation.
+5. After a separate explicit authorization for this local Git mutation, create the signed annotated tag `v0.2.0` on that exact commit. Verify that the ref resolves to a tag object, its trusted signature is valid, and it peels to the signed `main` commit. This authorization does not authorize a bundle transfer, build, transparency-log upload, branch push, tag push, or release operation.
+6. Create one bounded Git bundle whose advertised refs are exactly `refs/heads/main`, `refs/tags/v0.1.0`, and `refs/tags/v0.2.0`; do not use `--all`:
+
+   ```bash
+   git bundle create netops-helper-0.2.0.bundle \
+     refs/heads/main refs/tags/v0.1.0 refs/tags/v0.2.0
+   git bundle verify netops-helper-0.2.0.bundle
+   ```
+
+   Create it at a new path and never overwrite an existing bundle. Before transfer, require that its advertised ref set matches exactly, reject replace refs, verify the trusted signature of the selected `main` commit and both annotated tags, verify each tag's reviewed peel target, and require `v0.2.0` to match the canonical project version and peel to `main`.
+7. Transfer the verified bundle only through the guarded source updater. Before replacing any builder repository, it must inspect the bundle and independently verify the exact advertised refs, object types, trusted commit and tag signatures, peel targets, project version, clean `main`, canonical origin, and absence of replace refs. It must clone only into a new staging repository, then repeat those checks after the clone and before an atomic repository exchange. The staged and resulting builder repositories must retain exactly `v0.1.0` and `v0.2.0` as the required release tags; in particular, `v0.2.0` must remain a trusted annotated tag peeled to builder `HEAD`. A branch-only clone, a clone that drops either required tag, or any failed pre-exchange or post-clone check must fail before the ARM64 build.
+8. In the isolated builder, install `requirements-release.lock` with `--require-hashes`, run the portable contracts, full pytest, and the mandatory runtime suite, and reproduce the committed dependency SBOM byte-for-byte:
+
+   ```bash
+   PYTHONPATH=src python tests/run_tests.py
+   PYTHONPATH=src python tests/test_engine_contracts.py
+   python tests/test_proxy_contracts.py
+   python tests/test_egress_scripts.py
+   python tests/test_apply_egress_rules.py
+   NETOPS_REQUIRE_RUNTIME_TESTS=1 python -m pytest -q
+   python scripts/generate_sbom.py
+   git diff --exit-code -- sbom.cdx.json
+   python scripts/check_public_release.py
+   ```
+
+   The environment flag makes a missing runtime dependency fail collection instead of silently skipping the FortiOS wire-level test.
+9. Create the allowlisted source tree with `scripts/create_release_artifacts.py`. Docker Buildx runs only on this export; the release toolbox must not mount the host Docker socket. Build and test the Linux ARM64 image from the exact commit already bound to `v0.2.0`.
+10. Record the ARM64 OCI image digest, generate an image SBOM, and scan it with a current Grype vulnerability database. Run the release gate against the actual report:
+
+    ```bash
+    python scripts/check_public_release.py --grype-report path/to/grype-report.json
+    ```
+
+    The gate requires both `matches` and `ignoredMatches`, reports active and ignored counts for every severity, fails on active Critical findings, and requires rule attribution for ignored Critical findings. Counts from an earlier release are context, not a frozen 0.2.0 threshold. Review every active High/Medium finding and every ignored item; the command is not a substitute for risk analysis.
+11. Recreate the source export with the image digest, produce a deterministic source archive, and generate one SHA-256 manifest covering every published artifact. If the build or review fails, stop without pushing or silently moving, deleting, or recreating `v0.2.0`; any recovery from an unpublished tag requires a separately reviewed local procedure and a complete rebuild of the selected final commit.
+12. Only after the ARM64 build, runtime tests, SBOMs, vulnerability review, and release artifacts pass, request separate explicit approval for the public transparency-log write. Then run the guarded checksum-signing step with exact certificate identity and OIDC issuer values. It must refuse an existing signature bundle, fingerprint the release set before and after signing, verify the result offline, promote without overwrite, and preserve a failed private attempt for diagnosis. Approval for this transparency-log entry authorizes no public Git repository or release mutation.
+13. Treat branch push, tag push, draft creation, and draft publication as four independent public mutations. Immediately before each one, repeat its applicable preflight and obtain a separate explicit approval naming the exact operation. Push only the clean signed commit and the already verified tag; create the draft with the source archive, ARM64 OCI archive, image SBOM, complete Grype JSON, image digest, checksums, and signature bundle.
+14. Independently verify hosted checks for both pushed refs, the draft metadata, every artifact byte and digest, the signature, source allowlist, runtime wire test, and vulnerability counts before separately authorizing draft publication.
+
+The 0.2.0 release target remains Linux ARM64. Cross-building amd64 is intentionally excluded because it would require privileged host-level binfmt/QEMU setup. Other architectures can build reviewed source, but those builds are outside the official verification claim.
+
+Changing an image digest, lock, snapshot date, ignore rule, release test, or release tool is a reviewed source change. Pinning improves repeatability; it does not prove safety.

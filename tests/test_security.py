@@ -19,11 +19,19 @@ def envelope(alias: str = "device-a", role: str = "read-only") -> str:
         "password": "correct horse battery staple",
         "known_hosts": "test-key",
         "account_role": role,
-        "https_endpoints": [
-            {"path": "/status", "port": 443, "use_basic_auth": False},
-            {"path": "/api?view=health", "port": 8443, "use_basic_auth": True},
-        ],
         "fortios_output_standard_verified": True,
+        "ssh_platform": None,
+        "enabled_queries": [],
+        "egress": {
+            "addresses": ["192.0.2.10"],
+            "tcp_ports": [],
+            "udp_ports": [],
+            "tcp_port_ranges": [],
+            "udp_port_ranges": [],
+            "allow_icmp": False,
+            "allow_dns": False,
+            "tls_server_names": [],
+        },
         "read_inventory": {
             "interfaces": ["port3"],
             "services": ["example.service"],
@@ -36,12 +44,9 @@ def envelope(alias: str = "device-a", role: str = "read-only") -> str:
 def test_auth_context_requires_alias_and_read_only_enrollment() -> None:
     decoded = TargetAuth.decode("device-a", envelope())
     assert decoded.port == 22 and decoded.account_role == "read-only"
-    assert decoded.require_https_endpoint("/status", 443, False) == "/status"
     assert decoded.fortios_output_standard_verified is True
-    with pytest.raises(AuthenticationContextError):
-        decoded.require_https_endpoint("/?action=reboot", 443, True)
-    with pytest.raises(AuthenticationContextError):
-        decoded.require_https_endpoint("/status", 443, True)
+    assert not hasattr(decoded, "https_endpoints")
+    assert not hasattr(decoded, "require_https_endpoint")
     with pytest.raises(AuthenticationContextError):
         TargetAuth.decode("device-b", envelope())
     with pytest.raises(AuthenticationContextError):

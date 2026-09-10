@@ -13,14 +13,29 @@ PRIVATE_PEM = re.compile(
     r"-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----",
     re.DOTALL,
 )
-CISCO_SECRET = re.compile(r"(?im)(\b(?:enable\s+)?(?:secret|password)(?:\s+\d+)?\s+)\S+")
+CISCO_SECRET = re.compile(
+    r"(?im)^(\s*(?:enable\s+)?(?:secret|password)(?:\s+\d+)?\s+)\S+"
+)
 SHADOW_HASH = re.compile(r"(?m)^([^:\r\n]+:)(?:[!*][^:\r\n]*|\$[^:\r\n]+)(?=:)")
-LABELED_COMMUNITY = re.compile(r"(?i)(\bcommunity(?:\s*[:=]\s*|\s+))\S+")
+LABELED_COMMUNITY = re.compile(
+    r"""(?ix)
+    (
+      \b(?:snmp\s+)?community
+      (?:
+        \s+string\s+(?:configured|is)\s*[:=]\s*
+        |\s+(?:configured|is)\s*[:=]\s*
+        |\s*[:=]\s*
+        |\s+
+      )
+    )
+    ("(?:[^"\\]|\\.)*"|\S+)
+    """
+)
 SENSITIVE_TEXT_FIELD = re.compile(
-    r'''(?ix)
+    r"""(?ix)
     ("?(?:password|passwd|secret|api[_-]?token|access[_-]?token|private[_-]?key)"?\s*[:=]\s*)
     ("(?:[^"\\]|\\.)*"|[^,}\]\n]+)
-    '''
+    """
 )
 SENSITIVE_KEYS = {
     "password", "passwd", "secret", "token", "api_token", "access_token", "private_key",
@@ -29,7 +44,7 @@ SENSITIVE_KEYS = {
 
 
 def _normalize_secrets(secrets: Iterable[object]) -> tuple[str, ...]:
-    values = {str(value) for value in secrets if len(str(value)) >= 3}
+    values = {str(value) for value in secrets if len(str(value).encode("utf-8")) >= 3}
     return tuple(sorted(values, key=len, reverse=True))
 
 
@@ -40,8 +55,12 @@ def sanitize_text(value: str, secrets: Iterable[object] = ()) -> str:
     value = FORTI_ENC.sub("ENC <REDACTED>", value)
     value = SHADOW_HASH.sub(lambda match: match.group(1) + "<REDACTED>", value)
     value = CISCO_SECRET.sub(lambda match: match.group(1) + "<REDACTED>", value)
-    value = LABELED_COMMUNITY.sub(lambda match: match.group(1) + "<REDACTED>", value)
-    return SENSITIVE_TEXT_FIELD.sub(lambda match: match.group(1) + '"<REDACTED>"', value)
+    value = LABELED_COMMUNITY.sub(
+        lambda match: match.group(1) + "<REDACTED>", value,
+    )
+    return SENSITIVE_TEXT_FIELD.sub(
+        lambda match: match.group(1) + '"<REDACTED>"', value,
+    )
 
 
 def sanitize_object(value: Any, secrets: Iterable[object] = ()) -> Any:
