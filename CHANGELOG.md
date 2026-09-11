@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.2.1 - 2026-09-11
+
+Hardening release driven by an independent code audit of 0.2.0. No tool surface, query catalogue, or policy schema changes; every finding was fixed with a regression test and verified in the ARM64 toolbox.
+
+### Security
+
+- Hand the runner password to the askpass helper once over a per-session abstract Unix socket with peer-UID checking instead of exporting it into the `ssh` process environment for the whole session.
+- Redact every message the server emits, including notifications, server-initiated requests, and responses with unknown ids, using all credentials, SNMP communities, and authentication envelopes seen during the session.
+- Treat the injected `auth_context` envelope as a secret so that an echoed envelope can no longer expose a target password.
+- Open the device SSH/SFTP TCP connection to the egress-verified address and pass the hostname to Netmiko and asyncssh only for host-key matching, removing the second unverified DNS resolution.
+- Stop the community and bearer redaction patterns at line breaks, add Cisco type-7 (`key 7`, `md5 7`, `password 7`, `key-string 7`) and pre-shared secret patterns to the server redactor, and redact bare `token=` assignments in the proxy.
+- Bind the SSH continuation cache key to the credential digest and reject symlinked or non-regular vault files.
+
+### Robustness
+
+- Survive malformed or oversized client lines: deeply nested JSON no longer terminates the proxy, and lines above 1 MiB are rejected with a parse error.
+- Guard the final `child.wait` after `kill` and expand `~` in `NETOPS_*` path variables.
+- Record the canonical platform name in both audit records of an operation.
+
+### Egress firewall
+
+- Emit the ICMP echo-request rule with the numeric type that `iptables-save` renders (`--icmp-type 8`); bundles with `allow_icmp: true` previously failed the post-apply check and rolled back.
+- Require the DOCKER-USER jump to be the first FORWARD rule in both the checker and the apply helper; an earlier ACCEPT would bypass the managed chain.
+- Document embedded-DNS traffic outside the managed chain, the absence of reboot persistence together with a oneshot unit example, and fail-closed behaviour on iptables backend mismatch.
+
+### Release engineering and tests
+
+- Pin the upstream Netmiko session preparation on the wire for Cisco IOS/IOS-XE/NX-OS, Arista EOS, Junos, Junos ELS, Extreme EXOS, and Linux with a real Paramiko server, alongside the existing FortiOS wire test.
+- Make the SFTP path-confinement test discoverable by pytest and scan `query_catalog/` in the write-marker contract.
+- Fail the public release gate on tracked or unignored files outside the export allowlist, on credential-shaped material, and on CGNAT, link-local, ULA, and `.local`-style private network markers; scan lock, requirements-in, shell, and config files; ignore `vault.json`, `known_hosts`, and `.env`.
+- Uninstall `pip` from the runtime image after the hash-locked install and add OCI title, source, and licence labels.
+- State in the security model that the server validates envelope shape and policy, not origin, and document the per-alias rate window and the fixed engine limits and timeouts.
+
 ## 0.2.0 - 2026-09-10
 
 Second public release. This release keeps phase 1 deliberately read-only while making the enrolled diagnostic scope discoverable and substantially expanding bounded troubleshooting coverage.

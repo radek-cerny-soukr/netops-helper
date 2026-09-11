@@ -22,7 +22,7 @@ ASSIGNED_BARE_SECRET = re.compile(
     [^\s,}}\]\r\n]+
     """
 )
-BEARER_SECRET = re.compile(r"(?i)(\bbearer\s+)\S+")
+BEARER_SECRET = re.compile(r"(?i)(\bbearer[ \t]+)\S+")
 CISCO_ENABLE_SECRET = re.compile(
     r"(?im)(?<!\S)(enable[ \t]+(?:secret|password)(?:[ \t]+\d+)?[ \t]+)\S+"
 )
@@ -35,7 +35,11 @@ SNMP_CLI_SECRET = re.compile(
 SNMP_STATUS_SECRET = re.compile(
     r"(?i)(\bSNMP\s+community\s+string\s+(?:configured|is)\s*[:=]\s*)\S+"
 )
-COMMUNITY_VALUE_SECRET = re.compile(r"(?i)(\bcommunity\s+)(?!string\b)\S+")
+COMMUNITY_VALUE_SECRET = re.compile(r"(?i)(\bcommunity[ \t]+)(?!string\b)\S+")
+CISCO_TYPE7_SECRET = re.compile(r"(?im)(\b(?:key|key-string|md5|password)[ \t]+7[ \t]+)\S+")
+PRESHARED_SECRET = re.compile(
+    r'(?im)(\b(?:pre-shared-key|psksecret|psk|wpa-passphrase|bind-password)(?:[ \t]*[:=][ \t]*|[ \t]+))(?:"[^"\r\n]*"|\S+)'
+)
 SHADOW_HASH = re.compile(r"(?m)^([^:\r\n]+:)(?:[!*][^:\r\n]*|\$[^:\r\n]+)(?=:)")
 FORTI_ENC = re.compile(r"\bENC\s+\S+")
 PRIVATE_PEM = re.compile(
@@ -66,6 +70,8 @@ def redact(text: object, secrets: Iterable[str] = (), limit: int | None = None) 
     value = SNMP_CLI_SECRET.sub(lambda match: match.group(1) + "<REDACTED>", value)
     value = SNMP_STATUS_SECRET.sub(lambda match: match.group(1) + "<REDACTED>", value)
     value = COMMUNITY_VALUE_SECRET.sub(lambda match: match.group(1) + "<REDACTED>", value)
+    value = CISCO_TYPE7_SECRET.sub(lambda match: match.group(1) + "<REDACTED>", value)
+    value = PRESHARED_SECRET.sub(lambda match: match.group(1) + "<REDACTED>", value)
     value = BEARER_SECRET.sub(lambda match: match.group(1) + "<REDACTED>", value)
     value = ASSIGNED_QUOTED_SECRET.sub(_replace_quoted, value)
     value = ASSIGNED_BARE_SECRET.sub(_replace_bare, value)

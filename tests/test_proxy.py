@@ -98,7 +98,8 @@ def test_request_injects_read_only_scope_and_target_host_key(tmp_path: Path, mon
         "params":{"name":"ssh_read","arguments":{"target":"device-a","platform":"fortios","query":"system_status"}},
     }).encode())
     assert transformed is not None
-    assert proxy.response_secrets[21] == ("selected-secret", "separate-community")
+    assert proxy.response_secrets[21][:2] == ("selected-secret", "separate-community")
+    assert proxy.response_secrets[21][2] == json.loads(transformed)["params"]["arguments"]["auth_context"]
     encoded=json.loads(transformed)["params"]["arguments"]["auth_context"]
     scope=json.loads(urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)))
     assert scope["account_role"] == "read-only"
@@ -216,6 +217,59 @@ def test_batched_server_responses_are_sanitized() -> None:
     assert not proxy.pending
 
 
+def test_every_server_message_is_sanitized_with_session_secrets() -> None:
+    proxy = MODULE.Proxy(); proxy.pending[60] = "tools/call"
+    proxy.response_secrets[60] = ("credential-value",)
+    proxy.session_secrets.update(dict.fromkeys(("credential-value",)))
+    for message in (
+        {"jsonrpc": "2.0", "method": "notifications/message", "params": {"data": "credential-value"}},
+        {"jsonrpc": "2.0", "id": 61, "method": "sampling/createMessage", "params": {"text": "credential-value"}},
+        {"jsonrpc": "2.0", "id": 62, "result": {"content": [{"type": "text", "text": "credential-value"}]}},
+    ):
+        transformed = proxy.response(json.dumps(message).encode()).decode()
+        assert "credential-value" not in transformed
+        assert "<REDACTED>" in transformed
+    assert proxy.pending == {60: "tools/call"}
+
+
+def test_auth_context_envelope_is_redacted_from_server_messages() -> None:
+    envelope = MODULE.urlsafe_b64encode(b'{"password":"credential-value"}').decode().rstrip("=")
+    proxy = MODULE.Proxy(); proxy.pending[70] = "tools/call"
+    proxy.response_secrets[70] = ("credential-value", envelope)
+    proxy.session_secrets.update(dict.fromkeys(("credential-value", envelope)))
+    echoed = {"jsonrpc": "2.0", "id": 70, "error": {"code": -32602, "message": "bad", "data": {
+        "input": {"auth_context": "anything", "target": "edge-a"}, "text": "echo=" + envelope,
+    }}}
+    transformed = proxy.response(json.dumps(echoed).encode()).decode()
+    assert envelope not in transformed
+    assert '"auth_context":"<REDACTED>"' in transformed
+    notification = {"jsonrpc": "2.0", "method": "notifications/message", "params": {"data": envelope}}
+    assert envelope not in proxy.response(json.dumps(notification).encode()).decode()
+
+
+def test_malformed_or_oversized_requests_do_not_crash_the_proxy(capsys) -> None:
+    proxy = MODULE.Proxy()
+    for raw in (b"[" * 100_000 + b"]" * 100_000 + b"\n", b"\xff\xfe\n", b"x" * (MODULE.MAX_REQUEST_BYTES + 1)):
+        assert proxy.request(raw) is None
+        assert json.loads(capsys.readouterr().out)["error"]["code"] == -32700
+    assert proxy.request(b'{"jsonrpc":"2.0","id":1,"method":"tools/list"}\n') is not None
+
+
+def test_configured_paths_expand_home_and_symlinked_vault_is_rejected(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("NETOPS_VAULT_PATH", "~/vault.json")
+    assert MODULE._configured_path("NETOPS_VAULT_PATH", tmp_path / "x") == tmp_path / "vault.json"
+    real = tmp_path / "real-vault.json"
+    real.write_text("{}", encoding="utf-8"); real.chmod(0o600)
+    link = tmp_path / "vault-link.json"
+    link.symlink_to(real)
+    monkeypatch.setattr(MODULE, "VAULT", link)
+    with pytest.raises(MODULE.VaultPermissionError):
+        MODULE.Proxy()._load_vault_document()
+    monkeypatch.setattr(MODULE, "VAULT", real)
+    assert MODULE.Proxy()._load_vault_document() == {}
+
+
 def _paths(tmp_path: Path, monkeypatch):
     vault = tmp_path / "vault.json"
     known = tmp_path / "known_hosts"
@@ -324,7 +378,8 @@ def test_snmp_community_is_separate_injected_secret_without_fallback(
     context = _decode_context(transformed)
     assert context["snmp_community"] == "separate-community"
     assert context["password"] == "selected-secret"
-    assert proxy.response_secrets[70] == ("selected-secret", "separate-community")
+    assert proxy.response_secrets[70][:2] == ("selected-secret", "separate-community")
+    assert proxy.response_secrets[70][2] == json.loads(transformed)["params"]["arguments"]["auth_context"]
 
     data = json.loads(vault.read_text())
     del data["device-a"]["snmp_community"]
@@ -507,6 +562,17 @@ def test_askpass_uses_self_reexec_without_temporary_file(monkeypatch, capsys) ->
     source = SCRIPT.read_text()
     assert "mkstemp" not in source
     assert "tempfile" not in source
-    monkeypatch.setenv(MODULE.ASKPASS_SECRET_ENV, "askpass-secret")
-    assert MODULE._run_askpass() == 0
-    assert capsys.readouterr().out == "askpass-secret\n"
+    assert MODULE.ASKPASS_SOCKET_ENV in source
+    assert "_NETOPS_HELPER_ASKPASS_SECRET" not in source
+    child = MODULE.subprocess.Popen(["sleep", "30"])
+    try:
+        handoff = MODULE._AskpassHandoff("askpass-secret")
+        handoff.serve(child)
+        monkeypatch.setenv(MODULE.ASKPASS_SOCKET_ENV, handoff.name)
+        assert MODULE._run_askpass() == 0
+        assert capsys.readouterr().out == "askpass-secret\n"
+        assert MODULE._run_askpass() == 1
+        assert handoff._secret == ""
+    finally:
+        child.kill()
+        child.wait()

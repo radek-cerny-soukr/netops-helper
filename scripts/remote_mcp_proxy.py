@@ -14,7 +14,10 @@ import math
 import os
 from pathlib import Path, PurePosixPath
 import re
+import secrets as secrets_module
+import socket
 import stat
+import struct
 import subprocess
 import sys
 import threading
@@ -28,18 +31,21 @@ else:
     from proxy_sanitize import sanitize_object, sanitize_text
 
 
-CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "netops-helper"
-VAULT = Path(os.environ.get("NETOPS_VAULT_PATH", CONFIG_HOME / "vault.json"))
-KNOWN_HOSTS = Path(os.environ.get("NETOPS_KNOWN_HOSTS_PATH", Path.home() / ".ssh" / "known_hosts"))
-TARGET_POLICY = Path(os.environ.get(
-    "NETOPS_TARGET_POLICY_PATH", CONFIG_HOME / "target-policy.json",
-))
+def _configured_path(variable: str, default: Path) -> Path:
+    return Path(os.environ.get(variable, default)).expanduser()
+
+
+CONFIG_HOME = _configured_path("XDG_CONFIG_HOME", Path.home() / ".config") / "netops-helper"
+VAULT = _configured_path("NETOPS_VAULT_PATH", CONFIG_HOME / "vault.json")
+KNOWN_HOSTS = _configured_path("NETOPS_KNOWN_HOSTS_PATH", Path.home() / ".ssh" / "known_hosts")
+TARGET_POLICY = _configured_path("NETOPS_TARGET_POLICY_PATH", CONFIG_HOME / "target-policy.json")
 MASTER_ALIAS = os.environ.get("NETOPS_MASTER_ALIAS", "netops-runner")
 AUTH_FIELD = "auth_context"
 DEFAULT_RATE_REQUESTS = 30
 DEFAULT_RATE_WINDOW_SECONDS = 60
+MAX_REQUEST_BYTES = 1_048_576
 ASKPASS_MODE_ENV = "_NETOPS_HELPER_ASKPASS_MODE"
-ASKPASS_SECRET_ENV = "_NETOPS_HELPER_ASKPASS_SECRET"
+ASKPASS_SOCKET_ENV = "_NETOPS_HELPER_ASKPASS_SOCKET"
 SSH_TRANSPORT_FAILURE_MESSAGE = "The remote MCP SSH transport failed."
 RUNNER_ALIAS_FAILURE_MESSAGE = "The runner alias is not present in the credential vault."
 SSH_TOOLS = {"ssh_read", "sftp_stat"}
@@ -1202,6 +1208,7 @@ class Proxy:
         self.pending: dict[Any, str] = {}
         self.pending_tools: dict[Any, str] = {}
         self.response_secrets: dict[Any, tuple[str, ...]] = {}
+        self.session_secrets: dict[str, None] = {}
         self.control_payloads: dict[Any, dict[str, Any]] = {}
         self.pending_lock = threading.Lock()
         self.stdout_lock = threading.Lock()
@@ -1220,12 +1227,12 @@ class Proxy:
     def _load_vault_document(self) -> dict[str, Any]:
         with self.vault_lock:
             try:
-                mode = stat.S_IMODE(VAULT.stat().st_mode)
+                information = VAULT.lstat()
             except PermissionError as exc:
                 raise VaultPermissionError() from exc
             except OSError as exc:
                 raise AuthenticationMaterialError() from exc
-            if mode != 0o600:
+            if not stat.S_ISREG(information.st_mode) or stat.S_IMODE(information.st_mode) != 0o600:
                 raise VaultPermissionError()
             try:
                 data = json.loads(VAULT.read_text(encoding="utf-8"))
@@ -1940,9 +1947,12 @@ class Proxy:
         }
 
     def request(self, raw: bytes) -> bytes | None:
+        if len(raw) > MAX_REQUEST_BYTES:
+            self._emit_error(None, -32700, "Request exceeds the size limit.", notification=False)
+            return None
         try:
             message = json.loads(raw)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, RecursionError, UnicodeDecodeError):
             self._emit_error(None, -32700, "Invalid JSON.", notification=False)
             return None
         if not isinstance(message, dict):
@@ -2039,7 +2049,7 @@ class Proxy:
                 if self._rate_costs_slot(tool, args):
                     self._consume_rate_limit(alias, policy["rate_limit"])
                 args[AUTH_FIELD] = auth_context
-                secrets = self._record_secrets(record)
+                secrets = (*self._record_secrets(record), auth_context)
         except ProxyError as exc:
             self._emit_proxy_error(request_id, exc, notification)
             if has_id:
@@ -2052,6 +2062,7 @@ class Proxy:
             return None
         if has_id:
             self.response_secrets[request_id] = secrets
+            self.session_secrets.update(dict.fromkeys(secrets))
         return json.dumps(message, separators=(",", ":")).encode() + b"\n"
 
     @staticmethod
@@ -2151,8 +2162,8 @@ class Proxy:
                     control = self.control_payloads.pop(request_id, None)
             except TypeError:
                 pass
+        message = sanitize_object(message, (*secrets, *self.session_secrets))
         if method == "tools/call":
-            message = sanitize_object(message, secrets)
             if tool == "helper_status" and control is not None:
                 self._merge_control_payload(message, control)
             if tool not in CONTROL_TOOLS:
@@ -2295,8 +2306,55 @@ def _drain_stderr(
             state.update(emitted=True, category=category)
 
 
+class _AskpassHandoff:
+    def __init__(self, secret: str) -> None:
+        self.name = "netops-helper-askpass-" + secrets_module.token_hex(16)
+        self._secret = secret
+        self._listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self._listener.bind("\0" + self.name)
+        self._listener.listen(1)
+        self._listener.settimeout(0.5)
+
+    def serve(self, child: subprocess.Popen[bytes]) -> None:
+        threading.Thread(target=self._serve, args=(child,), daemon=True).start()
+
+    def _serve(self, child: subprocess.Popen[bytes]) -> None:
+        try:
+            while child.poll() is None:
+                try:
+                    connection, _ = self._listener.accept()
+                except socket.timeout:
+                    continue
+                with connection:
+                    credentials = connection.getsockopt(
+                        socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"),
+                    )
+                    _, uid, _ = struct.unpack("3i", credentials)
+                    if uid == os.getuid():
+                        connection.sendall(self._secret.encode())
+                        return
+        finally:
+            self._secret = ""
+            self._listener.close()
+
+
 def _run_askpass() -> int:
-    secret = os.environ.get(ASKPASS_SECRET_ENV)
+    name = os.environ.get(ASKPASS_SOCKET_ENV)
+    if not name:
+        return 1
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+            connection.settimeout(10)
+            connection.connect("\0" + name)
+            chunks = []
+            while True:
+                chunk = connection.recv(4096)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+    except OSError:
+        return 1
+    secret = b"".join(chunks).decode()
     if not secret:
         return 1
     sys.stdout.write(secret + "\n")
@@ -2323,10 +2381,12 @@ def main() -> int:
         _write_transport_diagnostic("auth_material", "The proxy script is not executable.")
         return 2
     secrets = proxy._record_secrets(master)
+    handoff = _AskpassHandoff(str(master["password"]))
+    master["password"] = ""
     env = os.environ.copy()
     env.update({
         "DISPLAY": ":0", "SSH_ASKPASS": str(askpass), "SSH_ASKPASS_REQUIRE": "force",
-        ASKPASS_MODE_ENV: "1", ASKPASS_SECRET_ENV: str(master["password"]),
+        ASKPASS_MODE_ENV: "1", ASKPASS_SOCKET_ENV: handoff.name,
     })
     try:
         child = subprocess.Popen(
@@ -2336,16 +2396,17 @@ def main() -> int:
     except OSError:
         _write_transport_diagnostic("ssh_transport", "The local SSH process could not start.")
         return 2
-    finally:
-        env.pop(ASKPASS_SECRET_ENV, None)
-        master["password"] = ""
+    handoff.serve(child)
     if child.stdin is None or child.stdout is None or child.stderr is None:
         child.terminate()
         try:
             child.wait(timeout=5)
         except subprocess.TimeoutExpired:
             child.kill()
-            child.wait(timeout=5)
+            try:
+                child.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
         _write_transport_diagnostic(
             "ssh_transport", "The local SSH process pipes are unavailable."
         )
@@ -2366,7 +2427,7 @@ def main() -> int:
     response_thread = threading.Thread(target=responses, daemon=True)
     response_thread.start()
     try:
-        for line in iter(sys.stdin.buffer.readline, b""):
+        for line in iter(lambda: sys.stdin.buffer.readline(MAX_REQUEST_BYTES + 1), b""):
             transformed = proxy.request(line)
             if transformed is not None:
                 child.stdin.write(transformed)
@@ -2389,7 +2450,10 @@ def main() -> int:
             exit_code = child.wait(timeout=5)
         except subprocess.TimeoutExpired:
             child.kill()
-            exit_code = child.wait(timeout=5)
+            try:
+                exit_code = child.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                exit_code = 1
     stderr_thread.join(timeout=1)
     if timed_out:
         _write_transport_diagnostic("ssh_timeout", "The remote MCP transport timed out.")

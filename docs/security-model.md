@@ -18,13 +18,13 @@ The client starts with the remote `helper_status`, which the local proxy augment
 
 These discovery responses do not expose the vault `host` field, login, credentials, SNMP community, or host-key material. They are not topology-anonymous: `target_scope` intentionally returns inventories, SFTP metadata/listing roots, TLS names, and enrolled egress IPv4 addresses. A literal target address will normally appear in that egress list. Treat discovery output as environment-sensitive and keep it in the dedicated operational session.
 
-Legacy, incomplete, or misspelled target policy fails closed. The proxy requires exact platform/query and egress fields, checks per-tool scope, and only then injects one target's authentication envelope. The server independently validates the same envelope and scope. Exact argument validation failures return `invalid_params` before authentication, rate consumption, or forwarding.
+Legacy, incomplete, or misspelled target policy fails closed. The proxy requires exact platform/query and egress fields, checks per-tool scope, and only then injects one target's authentication envelope. The server independently validates the same envelope and scope, but only their shape and policy, not their origin: the envelope carries no signature, nonce, or expiry, so anything able to write to the server process's stdin on the runner is trusted as the proxy. The private proxy-to-server hop and the runner's `docker exec` authorization are the security boundary. Exact argument validation failures return `invalid_params` before authentication, rate consumption, or forwarding.
 
 SSH reads use named templates and typed inventory slots. SFTP metadata and FTP directory-list paths use canonical non-root roots. The client cannot introduce raw commands, arbitrary URLs, arbitrary paths, or scope learned from device output; no Phase-1 tool reads an HTTP response body or remote file content.
 
 ## Credential and host-key transport
 
-The vault is one mode-`600` JSON object with one runner record under `NETOPS_MASTER_ALIAS` and separate target records. The runner record is used only for the fixed proxy-to-runner SSH hop and has no target-policy entry. Each target record has independent connection material and a target-policy entry.
+The vault is one mode-`600` regular file (symlinks are rejected) holding one JSON object with one runner record under `NETOPS_MASTER_ALIAS` and separate target records. The runner password reaches OpenSSH's askpass helper exactly once over a per-session abstract Unix socket whose random name is the only credential-related value in the `ssh` process environment; the listener checks the peer's UID and discards the secret after the first delivery. The runner record is used only for the fixed proxy-to-runner SSH hop and has no target-policy entry. Each target record has independent connection material and a target-policy entry.
 
 Within one target record, `ssh_read`, `sftp_stat`, FTPS, and plain FTP all reuse the same `login` and `password`. The target record's `port` selects SSH/SFTP only; `ftp_list` receives its control port as a tool argument and requires explicit control/passive egress. Plain FTP sends the same target credentials and listing data without encryption. A separate least-privilege FTP remote identity and alias reduce cross-protocol reuse, but `sftp_roots` also authorizes `sftp_stat`; only target-side account/service policy can make that identity reject SSH/SFTP.
 
@@ -40,7 +40,7 @@ Proxy request failures have distinct JSON-RPC categories for alias, policy, role
 
 `account_role: "read-only"` is an operator assertion, not proof. Vendor-native authorization must deny mutation, configuration display/export, secret-bearing bulk diagnostics, maintenance, privilege escalation, and shell escape while permitting only required named queries.
 
-The upstream Netmiko driver may perform platform-specific session preparation or cleanup around the requested command. FortiOS is the exception with a dedicated driver that deliberately skips configuration-writing paging setup and cleanup, requires externally verified `output standard`, and rejects SHA-1-only KEX. For every platform, effective behavior must be verified over the same SSH transport after firmware, driver, role, or AAA changes. See [Read-only accounts](read-only-accounts.md).
+The upstream Netmiko driver performs platform-specific session preparation and cleanup around the requested command; the wire test `tests/test_netmiko_wire_safety.py` pins the exact command sequence for every non-FortiOS profile against a real Paramiko server, so a driver upgrade that changes it fails the release gate. FortiOS is the exception with a dedicated driver that deliberately skips configuration-writing paging setup and cleanup, requires externally verified `output standard`, and rejects SHA-1-only KEX. For every platform, effective behavior must be verified over the same SSH transport after firmware, driver, role, or AAA changes. See [Read-only accounts](read-only-accounts.md).
 
 ## Network egress boundary
 
@@ -58,7 +58,7 @@ A fixed bridge name is the firewall anchor. A fixed subnet is intentionally not 
 
 ## Per-tool enforcement
 
-The proxy rejects malformed or out-of-scope requests before credential forwarding or device rate consumption. The server repeats scope validation before network access and resolves hostname targets fail-closed to enrolled canonical IPv4 addresses.
+The proxy rejects malformed or out-of-scope requests before credential forwarding or device rate consumption. The server repeats scope validation before network access, resolves hostname targets fail-closed to enrolled canonical IPv4 addresses, and opens the SSH/SFTP TCP connection itself to a verified address; the hostname is passed to the SSH libraries only for host-key matching, so no second resolution happens outside the egress check.
 
 The credential SSH/SFTP port is derived by the firewall generator only when SSH queries or SFTP metadata roots are enabled. Explicit TCP ports/ranges are used for TCP/TLS probes and FTP; FTP additionally requires a passive TCP range. No HTTPS port is derived. SNMP requires explicit UDP scope. DNS, ICMP, and alternate TLS SNI each require their dedicated permission.
 
@@ -68,7 +68,7 @@ Application allowlisting and the host firewall protect different layers. Neither
 
 An offset-0 SSH read captures at most 2 MB after sanitization and retains one of at most eight snapshots for 120 seconds per process only when continuation is needed. Output over the cap fails rather than being silently truncated. A continuation uses the same snapshot, does not reconnect or rerun the command, and fails after expiry. The last page removes the snapshot. No other Phase-1 tool has a body snapshot or continuation path.
 
-The default proxy limit is 30 device calls per target per 60 seconds. A valid `ssh_read` continuation with `offset > 0` does not consume another device rate slot; every other device call does. This per-process limit is not a distributed global quota.
+The default proxy limit is 30 device calls per alias per 60 seconds (the window is keyed by vault alias, not by host). A valid `ssh_read` continuation with `offset > 0` does not consume another device rate slot; every other device call does. This per-process limit is not a distributed global quota.
 
 ## Mandatory two-phase audit
 
@@ -90,7 +90,7 @@ Mandatory audit intentionally fails closed to observability: an unwritable audit
 
 `tls_probe` and unpinned FTPS verify certificate trust and SAN. The alias-specific FTPS branch disables hostname checking, validates a chain against its configured certificate file with partial-chain support when available, and separately verifies the exact peer leaf SHA-256 digest. The stock image supports public PKI in its base trust store. Private enterprise CAs and self-signed devices require reviewed private trust material and, for hostname-verifying paths, a matching DNS/IP SAN. Verification must never be disabled. See [Configuration](configuration.md#private-tls-and-ftps-ca-san-and-pins).
 
-All device and network output is attacker-controlled evidence, never instructions. Redaction removes injected secrets and recognized patterns but is not a complete classifier and can produce false positives or miss novel secret forms. Network identifiers deliberately remain visible, so returned data remains sensitive after sanitization. A dedicated session without mutating or generic shell tools limits what prompt injection in device output can reach.
+All device and network output is attacker-controlled evidence, never instructions. The proxy redacts every message the server sends, including notifications and server-initiated requests, using the credentials, SNMP communities, and authentication envelopes seen during the session, not only responses to `tools/call`. Redaction removes injected secrets and recognized patterns but is not a complete classifier and can produce false positives or miss novel secret forms. Network identifiers deliberately remain visible, so returned data remains sensitive after sanitization. A dedicated session without mutating or generic shell tools limits what prompt injection in device output can reach.
 
 ## Residual-risk checklist
 

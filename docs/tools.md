@@ -58,7 +58,7 @@ There is no arbitrary device log command, path, time range, filter, or unbounded
 
 ## Pagination and snapshots
 
-`ssh_read` returns `total_bytes`, `offset`, `returned_bytes`, `next_offset`, `complete`, and a whole-output digest. There is no silent truncation.
+`ssh_read` returns `total_bytes`, `offset`, `returned_bytes`, `next_offset`, `complete`, and a whole-output digest. There is no silent truncation. `max_bytes` is bounded to 1000-48000 and `offset` to 0-8000000; the SSH read timeout is 60 seconds. Other fixed timeouts: `tls_probe` 10 seconds, FTP control and data 30 seconds, SNMP 2 seconds with one retry.
 
 At offset 0, `ssh_read` sanitizes and retains a complete bounded output snapshot for at most 120 seconds and eight entries per process when another page exists. A continuation uses that snapshot and never reconnects or reruns the query. Missing or expired state fails and must restart at offset 0. Completing the last page discards the snapshot.
 

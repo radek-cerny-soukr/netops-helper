@@ -532,7 +532,7 @@ def _scope_rules(destination: str, scope: dict[str, Any]) -> list[str]:
             rules.append(_accept_rule(destination, protocol, item))
     if scope["allow_icmp"]:
         rules.append(
-            f"-A {CHAIN_NAME} -d {destination} -p icmp -m icmp --icmp-type echo-request -j ACCEPT"
+            f"-A {CHAIN_NAME} -d {destination} -p icmp -m icmp --icmp-type 8 -j ACCEPT"
         )
     return rules
 

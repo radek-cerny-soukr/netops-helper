@@ -20,7 +20,25 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
-TEXT_SUFFIXES = {"", ".json", ".md", ".py", ".toml", ".txt", ".yaml", ".yml"}
+TEXT_SUFFIXES = {
+    "", ".cfg", ".env", ".in", ".ini", ".json", ".lock", ".md", ".py", ".sh", ".toml", ".txt",
+    ".yaml", ".yml",
+}
+SECRET_MATERIAL_MARKERS = (
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{36}\b"),
+    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{22,}\b"),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    re.compile(r"\bxox[abprs]-[0-9A-Za-z-]{10,}\b"),
+    re.compile(r"\bsk-[A-Za-z0-9]{20,}\b"),
+    re.compile(r"\bssh-(?:ed25519|rsa|dss) AAAA[0-9A-Za-z+/]{40,}"),
+)
+PRIVATE_NETWORK_MARKERS = (
+    re.compile(r"(?<![0-9])100\.(?:6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.[0-9]{1,3}\.[0-9]{1,3}(?![0-9])"),
+    re.compile(r"(?<![0-9])169\.254\.[0-9]{1,3}\.[0-9]{1,3}(?![0-9])"),
+    re.compile(r"(?<![0-9a-f:])f[cd][0-9a-f]{2}:[0-9a-f:]+", re.IGNORECASE),
+    re.compile(r"(?<![0-9a-f:])fe80:[0-9a-f:]+", re.IGNORECASE),
+    re.compile(r"\b[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.(?:local|lan|home\.arpa|internal|intranet)\b", re.IGNORECASE),
+)
 SEVERITIES = ("Critical", "High", "Medium", "Low", "Negligible", "Unknown")
 RELEASE_VERSION_PATTERN = re.compile(
     r"[0-9]+\.[0-9]+\.[0-9]+(?:[.-][0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?"
@@ -45,6 +63,7 @@ REQUIRED_RELEASE_PATHS = {
     "tests/test_egress_scripts.py",
     "tests/test_engine_contracts.py",
     "tests/test_fortios_wire_safety.py",
+    "tests/test_netmiko_wire_safety.py",
     "tests/test_policy_parity.py",
     "tests/test_proxy_contracts.py",
     "tests/test_query_catalog_arista.py",
@@ -860,8 +879,8 @@ def check(root: Path = ROOT) -> list[str]:
 
     try:
         files = _tracked_release_files(root)
-    except Exception:
-        return ["public release source selection is unavailable or invalid"]
+    except Exception as exc:
+        return [f"public release source selection is unavailable or invalid: {exc}"]
     errors = _version_invariant_errors(root)
     relative_files = {path.relative_to(root).as_posix() for path in files}
     for relative in sorted(REQUIRED_RELEASE_PATHS):
@@ -870,7 +889,8 @@ def check(root: Path = ROOT) -> list[str]:
         elif relative not in relative_files:
             errors.append(f"required release artifact is outside allowlist: {relative}")
 
-    forbidden_names = {"vault.json", "target-policy.json", "known_hosts"}
+    forbidden_names = {"vault.json", "target-policy.json", "known_hosts", ".env"}
+    errors.extend(_tracked_outside_allowlist_errors(root, relative_files))
     private_markers = (
         re.compile(r"begin\s+private\s+key", re.IGNORECASE),
         re.compile(r"/workspace(?:/|$)", re.IGNORECASE),
@@ -916,6 +936,7 @@ def check(root: Path = ROOT) -> list[str]:
                     errors.append(f"private marker in {relative}")
             if private_ipv4.search(text):
                 errors.append(f"private IPv4 address in {relative}")
+            errors.extend(_secret_and_network_marker_errors(relative.as_posix(), text))
             if hardcoded_trust_file.search(text):
                 errors.append(f"hard-coded environment trust file in {relative}")
 
@@ -1041,6 +1062,34 @@ def check_grype_report(path: Path) -> tuple[list[str], dict[str, dict[str, int]]
             f"Grype report contains {counts['active']['Critical']} active Critical findings"
         )
     return errors, counts
+
+
+def _secret_and_network_marker_errors(relative: str, text: str) -> list[str]:
+    errors: list[str] = []
+    if any(marker.search(text) for marker in SECRET_MATERIAL_MARKERS):
+        errors.append(f"credential-shaped material in {relative}")
+    if not relative.startswith("tests/") and any(
+        marker.search(text) for marker in PRIVATE_NETWORK_MARKERS
+    ):
+        errors.append(f"private network marker in {relative}")
+    return errors
+
+
+def _tracked_outside_allowlist_errors(root: Path, relative_files: set[str]) -> list[str]:
+    if not (root / ".git").exists():
+        return []
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(root), "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+            capture_output=True, check=True, timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ["git working tree could not be enumerated"]
+    tracked = {item.decode("utf-8", "replace") for item in completed.stdout.split(b"\0") if item}
+    return [
+        f"tracked or unignored file outside release allowlist: {item}"
+        for item in sorted(tracked - relative_files)
+    ]
 
 
 def main() -> int:

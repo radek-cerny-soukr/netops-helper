@@ -29,9 +29,9 @@ def _regular_file_stat(path: Path) -> os.stat_result:
     try:
         information = path.lstat()
     except OSError as exc:
-        raise ReleaseSelectionError("public source entry is unavailable") from exc
+        raise ReleaseSelectionError(f"public source entry is unavailable: {path.name}") from exc
     if not stat.S_ISREG(information.st_mode):
-        raise ReleaseSelectionError("public source entry is not a regular file")
+        raise ReleaseSelectionError(f"public source entry is not a regular file: {path.name}")
     return information
 
 
@@ -92,7 +92,8 @@ TESTS = {
     "tests/run_tests.py", "tests/test_apply_egress_rules.py",
     "tests/test_audit_rotation.py", "tests/test_egress_scripts.py",
     "tests/test_engine_contracts.py", "tests/test_engine_safety.py",
-    "tests/test_fortios_wire_safety.py", "tests/test_phase1_surface.py",
+    "tests/test_fortios_wire_safety.py", "tests/test_netmiko_wire_safety.py",
+    "tests/test_phase1_surface.py",
     "tests/test_plain_ftp_acknowledgement.py", "tests/test_policy_parity.py",
     "tests/test_proxy.py", "tests/test_proxy_contracts.py",
     "tests/test_query_catalog_arista.py", "tests/test_query_catalog_cisco.py",

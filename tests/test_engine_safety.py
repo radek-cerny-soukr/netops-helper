@@ -46,6 +46,91 @@ def auth(*, fortios_verified: bool = True) -> TargetAuth:
     )
 
 
+def test_ssh_cache_key_binds_the_credential_and_audit_platform_is_canonical() -> None:
+    base = auth()
+    assert engine._ssh_cache_key(base, "fortinet", "q", None) != engine._ssh_cache_key(
+        replace(base, password="other-credential"), "fortinet", "q", None,
+    )
+    fields = engine._audit_fields({"platform": "fortios", "query": "system_status"}, {})
+    assert fields["platform"] == "fortinet"
+    assert engine._audit_fields({"platform": "not-a-platform"}, {})["platform"] == "not-a-platform"
+
+
+class FakeSocket:
+    def __init__(self) -> None:
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_verified_socket_connects_to_resolved_address_not_hostname(monkeypatch) -> None:
+    captured = {}
+    named = replace(auth(), host="device.example.invalid", egress=replace(auth().egress, allow_dns=True))
+    monkeypatch.setattr(
+        engine.socket, "getaddrinfo",
+        lambda *args, **kwargs: [(None, None, None, None, (TEST_ADDRESS, 0))],
+    )
+
+    def fake_create_connection(address, timeout=None):
+        captured["address"] = address
+        captured["timeout"] = timeout
+        return FakeSocket()
+
+    monkeypatch.setattr(engine.socket, "create_connection", fake_create_connection)
+    assert isinstance(engine._open_verified_socket(named), FakeSocket)
+    assert captured["address"] == (TEST_ADDRESS, 22)
+    assert captured["timeout"] == 10.0
+
+
+def test_verified_socket_refuses_address_outside_egress(monkeypatch) -> None:
+    named = replace(auth(), host="device.example.invalid", egress=replace(auth().egress, allow_dns=True))
+    monkeypatch.setattr(
+        engine.socket, "getaddrinfo",
+        lambda *args, **kwargs: [(None, None, None, None, ("198.51.100.99", 0))],
+    )
+    monkeypatch.setattr(
+        engine.socket, "create_connection",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not connect")),
+    )
+    with pytest.raises(EgressScopeError):
+        engine._open_verified_socket(named)
+
+
+def test_netmiko_connection_reuses_verified_socket_and_keeps_hostname_for_host_key(monkeypatch) -> None:
+    captured = {}
+    sock = FakeSocket()
+
+    class FakeConnection:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def disconnect(self):
+            captured["disconnected"] = True
+
+    monkeypatch.setattr(engine, "ConnectHandler", FakeConnection)
+    monkeypatch.setattr(engine, "_open_verified_socket", lambda target: sock)
+    with engine.netmiko_connection(auth(), "linux"):
+        assert sock.closed is False
+    assert captured["sock"] is sock
+    assert captured["host"] == auth().host
+    assert captured["disconnected"] is True
+    assert sock.closed is True
+
+
+def test_netmiko_connection_closes_socket_when_driver_fails(monkeypatch) -> None:
+    sock = FakeSocket()
+    monkeypatch.setattr(engine, "_open_verified_socket", lambda target: sock)
+    monkeypatch.setattr(
+        engine, "ConnectHandler",
+        lambda **kwargs: (_ for _ in ()).throw(OSError("handshake failed")),
+    )
+    with pytest.raises(OSError):
+        with engine.netmiko_connection(auth(), "linux"):
+            pass
+    assert sock.closed is True
+
+
 def test_fortios_connection_uses_read_only_driver_and_disables_sha1_kex(monkeypatch) -> None:
     captured = {}
 
@@ -63,6 +148,7 @@ def test_fortios_connection_uses_read_only_driver_and_disables_sha1_kex(monkeypa
             AssertionError("Fortinet must use the read-only connection class")
         ),
     )
+    monkeypatch.setattr(engine, "_open_verified_socket", lambda target: FakeSocket())
     with engine.netmiko_connection(auth(), "fortios"):
         pass
     assert captured["device_type"] == "fortinet"
@@ -107,6 +193,7 @@ def test_canonical_platform_uses_expected_netmiko_device_type(
             captured["disconnected"] = True
 
     monkeypatch.setattr(engine, "ConnectHandler", FakeConnection)
+    monkeypatch.setattr(engine, "_open_verified_socket", lambda target: FakeSocket())
     with engine.netmiko_connection(auth(), platform):
         pass
     assert captured["device_type"] == expected_device_type
@@ -181,8 +268,8 @@ def test_ssh_query_policy_rejects_before_connection_with_audit_names(monkeypatch
     with pytest.raises(PolicyScopeError):
         engine.ssh_read(auth(), "fortios", "routing_table", None, 0, 1000)
     assert [(item["status"], item["platform"], item["query"]) for item in events] == [
-        ("started", "fortios", "routing_table"),
-        ("rejected", "fortios", "routing_table"),
+        ("started", "fortinet", "routing_table"),
+        ("rejected", "fortinet", "routing_table"),
     ]
     assert all("parameters" not in item and "path" not in item for item in events)
 

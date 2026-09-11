@@ -150,7 +150,7 @@ def _run_core_contracts() -> None:
     assert not (ROOT / "plugin").exists()
     source = "\n".join(
         path.read_text(encoding="utf-8").lower()
-        for path in (ROOT / "src/netops_helper").glob("*.py")
+        for path in (ROOT / "src/netops_helper").rglob("*.py")
     )
     forbidden = (
         "prepare_",

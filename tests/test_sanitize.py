@@ -58,6 +58,33 @@ def test_redaction_limit_is_still_enforced() -> None:
         raise AssertionError("redaction limit was not enforced")
 
 
+def test_community_and_bearer_do_not_cross_line_breaks() -> None:
+    source = 'config system snmp community\n    edit 1\n        set name "public"'
+    assert redact(source) == source
+    neighbor = "Neighbor 192.0.2.1 community\nlocalpref 100"
+    assert redact(neighbor) == neighbor
+    bearer = "The bearer\nof this packet"
+    assert redact(bearer) == bearer
+
+
+def test_type7_and_preshared_secrets_are_redacted() -> None:
+    cleaned = redact(
+        "radius-server host 192.0.2.9 key 7 0A1B2C\n"
+        "ip ospf message-digest-key 1 md5 7 0A1B2C\n"
+        "key-string 7 0A1B2C\n"
+        "user reader password 7 0822455D0A16\n"
+        "set psksecret ENC-free-value\n"
+        "pre-shared-key: \"abc def\"\n"
+        "wpa-passphrase=abc\n"
+    )
+    assert "0A1B2C" not in cleaned
+    assert "0822455D0A16" not in cleaned
+    assert "ENC-free-value" not in cleaned
+    assert "abc def" not in cleaned
+    assert "wpa-passphrase=<REDACTED>" in cleaned
+    assert "radius-server host 192.0.2.9 key 7 <REDACTED>" in cleaned
+
+
 def main() -> int:
     test_log_language_is_preserved()
     test_snmp_status_redacts_the_value_not_the_neighboring_word()
@@ -65,6 +92,8 @@ def main() -> int:
     test_structured_and_cli_secrets_are_redacted()
     test_exact_injected_secrets_and_diagnostic_context()
     test_redaction_limit_is_still_enforced()
+    test_community_and_bearer_do_not_cross_line_breaks()
+    test_type7_and_preshared_secrets_are_redacted()
     print("sanitize_tests=passed")
     return 0
 

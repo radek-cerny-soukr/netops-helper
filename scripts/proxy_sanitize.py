@@ -24,8 +24,8 @@ LABELED_COMMUNITY = re.compile(
       (?:
         \s+string\s+(?:configured|is)\s*[:=]\s*
         |\s+(?:configured|is)\s*[:=]\s*
-        |\s*[:=]\s*
-        |\s+
+        |[ \t]*[:=][ \t]*
+        |[ \t]+
       )
     )
     ("(?:[^"\\]|\\.)*"|\S+)
@@ -33,13 +33,13 @@ LABELED_COMMUNITY = re.compile(
 )
 SENSITIVE_TEXT_FIELD = re.compile(
     r"""(?ix)
-    ("?(?:password|passwd|secret|api[_-]?token|access[_-]?token|private[_-]?key)"?\s*[:=]\s*)
+    ("?(?:password|passwd|secret|(?:api[_-]?|access[_-]?)?token|private[_-]?key)"?[ \t]*[:=][ \t]*)
     ("(?:[^"\\]|\\.)*"|[^,}\]\n]+)
     """
 )
 SENSITIVE_KEYS = {
     "password", "passwd", "secret", "token", "api_token", "access_token", "private_key",
-    "community",
+    "community", "auth_context",
 }
 
 

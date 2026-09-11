@@ -128,6 +128,18 @@ def observed_state(bundle: dict) -> dict:
 
 
 class GeneratorTests(unittest.TestCase):
+    def test_icmp_rule_uses_iptables_save_numeric_type(self) -> None:
+        vault, policy = fixture()
+        bundle = generator.build_bundle(vault, policy, "netops-runner")
+        rules = bundle["ruleset"]["ipv4"]["chain_rules"]
+        icmp_rules = [rule for rule in rules if " -p icmp " in rule]
+        self.assertEqual(
+            icmp_rules,
+            [f"-A {generator.CHAIN_NAME} -d 192.0.2.10/32 -p icmp -m icmp --icmp-type 8 -j ACCEPT"],
+        )
+        self.assertFalse(any("echo-request" in rule for rule in rules))
+        self.assertEqual(checker.check(bundle, observed_state(bundle)), [])
+
     def test_strict_bundle_contains_only_non_secret_scope(self) -> None:
         vault, policy = fixture()
         bundle = generator.build_bundle(vault, policy, "netops-runner")
@@ -387,7 +399,7 @@ class GeneratorTests(unittest.TestCase):
             vault_path.chmod(0o644)
             policy_path.write_text(json.dumps(policy), encoding="utf-8")
             completed = subprocess.run(
-                [sys.executable, str(GENERATOR_PATH), "--vault", str(vault_path),
+                [sys.executable, "-B", str(GENERATOR_PATH), "--vault", str(vault_path),
                  "--policy", str(policy_path), "--output", str(output_path)],
                 text=True,
                 capture_output=True,
@@ -400,6 +412,17 @@ class GeneratorTests(unittest.TestCase):
 
 
 class CheckerTests(unittest.TestCase):
+    def test_checker_requires_docker_user_jump_to_be_first_in_forward(self) -> None:
+        vault, policy = fixture()
+        bundle = generator.build_bundle(vault, policy, "netops-runner")
+        state = observed_state(bundle)
+        state["ipv4_save"] = "-A FORWARD -i nh-egress0 -j ACCEPT\n" + state["ipv4_save"]
+        self.assertIn("ipv4_docker_user_unreachable", checker.check(bundle, state))
+        state["ipv4_save"] = state["ipv4_save"].replace(
+            "-A FORWARD -i nh-egress0 -j ACCEPT\n", "",
+        ) + "\n-A FORWARD -j ACCEPT"
+        self.assertNotIn("ipv4_docker_user_unreachable", checker.check(bundle, state))
+
     def test_checker_accepts_ipv6_disabled_network_and_ipv4_guard(self) -> None:
         vault, policy = fixture()
         bundle = generator.build_bundle(vault, policy, "netops-runner")

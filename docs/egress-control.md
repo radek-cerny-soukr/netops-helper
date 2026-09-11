@@ -36,7 +36,7 @@ The server resolves the hostname and rejects any canonical IPv4 result outside t
 
 Docker commonly presents `127.0.0.11` to the container as embedded DNS and performs forwarding/NAT internally. The exact path is engine- and host-dependent. A generated upstream-resolver rule is not proof that embedded DNS is constrained or even functional.
 
-Once UDP/TCP 53 is permitted to a resolver, a compromised process can use DNS queries as an exfiltration channel; the firewall does not validate requested names. The strictest profile therefore uses literal IP targets, `allow_dns: false`, and no resolvers. Hostname targets accept this DNS tradeoff. Application-level resolution checks also have re-resolution/TOCTOU limits, so the verified host firewall remains the authoritative network boundary.
+Once UDP/TCP 53 is permitted to a resolver, a compromised process can use DNS queries as an exfiltration channel; the firewall does not validate requested names. The strictest profile therefore uses literal IP targets, `allow_dns: false`, and no resolvers. Hostname targets accept this DNS tradeoff. Even with `allow_dns: false` the chain only drops resolver traffic that leaves the bridge as forwarded packets; queries the container sends to Docker's embedded `127.0.0.11` are answered or forwarded by the Docker daemon from the host's own network stack, which DOCKER-USER never sees. Closing that path is a host INPUT/OUTPUT decision, not something this bundle can enforce. Application-level resolution checks also have re-resolution/TOCTOU limits, so the verified host firewall remains the authoritative network boundary.
 
 ## Residual host-access boundary
 
@@ -52,6 +52,29 @@ Before relying on the control, an ARM64 live test must verify:
 - attempts to reach runner-local listening services through bridge and host addresses;
 - survival and ordering of the DOCKER-USER jump across Docker restart;
 - checker detection of rule drift.
+
+The checker and the apply helper require the DOCKER-USER jump to be the first rule of FORWARD, the position Docker itself installs; an earlier `ACCEPT` would bypass the managed chain, so any other ordering fails closed as `docker_user_unreachable`.
+
+## Persistence across reboot
+
+The apply helper writes live kernel state only. Nothing in this project persists the rules: after a reboot the chain is gone while `restart: unless-stopped` brings the container back with unrestricted egress. Re-apply the reviewed bundle from the host before the container is reachable, for example with a oneshot unit ordered after Docker:
+
+```
+[Unit]
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/netops-helper/scripts/apply_egress_rules.py --bundle /etc/netops-helper/egress-bundle.json --apply
+
+[Install]
+WantedBy=multi-user.target
+```
+
+The helper is idempotent and fails closed, so a repeated run is safe; the checker should still run after every Docker restart or network recreation.
+
+The helper reads and writes rules through whichever `iptables-save`/`iptables-restore` binaries are on `PATH`. If those are the legacy backend while Docker installed its chains through iptables-nft (or vice versa), the DOCKER-USER chain does not appear in the observed state and the run fails closed as `docker_user_missing` rather than installing rules into a table Docker never consults.
 
 If runner-host access must be denied, design a host-specific INPUT policy after these observations, preserve required DNS/NAT behavior, and retest. Do not describe the generated rules as a sandbox or full compromise containment.
 

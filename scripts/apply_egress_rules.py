@@ -181,7 +181,7 @@ def _valid_owned_chain_rule(line: str) -> bool:
     )
     icmp = re.fullmatch(
         rf'-A {re.escape(generator.CHAIN_NAME)} -d \S+ -p icmp -m icmp '
-        rf'--icmp-type echo-request -j ACCEPT',
+        rf'--icmp-type 8 -j ACCEPT',
         line,
     )
     return tcp_or_udp is not None or icmp is not None
@@ -222,10 +222,7 @@ def snapshot_owned(save: str) -> dict[str, Any]:
     if any(not _is_owned_jump(line) for line in marker_lines):
         raise EgressApplyError("foreign_marker_collision")
     docker_user = _rules(save, "DOCKER-USER")
-    if not any(
-        _has_exact_jump(line.strip(), "FORWARD", "DOCKER-USER")
-        for line in save.splitlines()
-    ):
+    if not checker._has_forward_jump(save):
         raise EgressApplyError("docker_user_unreachable")
     if not any(line.startswith(":DOCKER-USER ") for line in save.splitlines()):
         raise EgressApplyError("docker_user_missing")

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager, contextmanager
 from functools import wraps
 import inspect
@@ -115,12 +116,17 @@ def _resolve_target_ipv4(auth: TargetAuth) -> tuple[str, ...]:
     return addresses
 
 
+def _open_verified_socket(auth: TargetAuth, timeout: float = 10.0) -> socket.socket:
+    address = _resolve_target_ipv4(auth)[0]
+    return socket.create_connection((address, auth.port), timeout=timeout)
+
+
 @contextmanager
 def netmiko_connection(auth: TargetAuth, platform: str) -> Iterator[Any]:
     normalized = normalize_platform(platform)
-    _resolve_target_ipv4(auth)
     if normalized == "fortinet" and not auth.fortios_output_standard_verified:
         raise ValueError("FortiOS output standard must be independently verified before enrollment")
+    sock = _open_verified_socket(auth)
     with _known_hosts_file(auth) as known_hosts_path:
         connection_factory = (
             ReadOnlyFortinetSSH if normalized == "fortinet" else ConnectHandler
@@ -130,26 +136,32 @@ def netmiko_connection(auth: TargetAuth, platform: str) -> Iterator[Any]:
             if normalized == "fortinet"
             else {}
         )
-        connection = connection_factory(
-            device_type=_NETMIKO_DEVICE_TYPES[normalized],
-            host=auth.host,
-            port=auth.port,
-            username=auth.login,
-            password=auth.password,
-            conn_timeout=10,
-            auth_timeout=12,
-            banner_timeout=15,
-            fast_cli=False,
-            ssh_strict=True,
-            system_host_keys=False,
-            alt_host_keys=True,
-            alt_key_file=known_hosts_path,
-            **extra,
-        )
+        try:
+            connection = connection_factory(
+                device_type=_NETMIKO_DEVICE_TYPES[normalized],
+                host=auth.host,
+                port=auth.port,
+                username=auth.login,
+                password=auth.password,
+                sock=sock,
+                conn_timeout=10,
+                auth_timeout=12,
+                banner_timeout=15,
+                fast_cli=False,
+                ssh_strict=True,
+                system_host_keys=False,
+                alt_host_keys=True,
+                alt_key_file=known_hosts_path,
+                **extra,
+            )
+        except BaseException:
+            sock.close()
+            raise
         try:
             yield connection
         finally:
             connection.disconnect()
+            sock.close()
 
 
 def _safe_error(exc: Exception, auth: TargetAuth) -> str:
@@ -223,6 +235,11 @@ def _audit_fields(arguments: dict[str, Any], result: dict[str, Any]) -> dict[str
         value = arguments.get(name)
         if isinstance(value, str):
             fields[name] = value
+    if isinstance(fields.get("platform"), str):
+        try:
+            fields["platform"] = normalize_platform(fields["platform"])
+        except ValueError:
+            pass
     path = arguments.get("remote_path")
     if isinstance(path, str):
         fields["path_sha256"] = digest_text(path)
@@ -323,6 +340,7 @@ def _ssh_cache_key(
 ) -> tuple[Any, ...]:
     return (
         auth.alias, auth.host, auth.port, auth.login,
+        hashlib.sha256(auth.password.encode("utf-8", "replace")).hexdigest(),
         platform, query, tuple(sorted((parameters or {}).items())),
     )
 
@@ -551,11 +569,12 @@ async def snmp_get(auth: TargetAuth, oids: list[str], port: int) -> dict[str, An
 async def _sftp_client(auth: TargetAuth):
     import asyncssh
 
-    _resolve_target_ipv4(auth)
+    sock = await asyncio.to_thread(_open_verified_socket, auth)
     with _known_hosts_file(auth) as known_hosts_path:
         async with asyncssh.connect(
             auth.host,
             port=auth.port,
+            sock=sock,
             username=auth.login,
             password=auth.password,
             client_keys=[],

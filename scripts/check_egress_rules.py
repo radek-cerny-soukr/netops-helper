@@ -212,10 +212,8 @@ def _has_exact_jump(line: str, source_chain: str, target_chain: str) -> bool:
 
 
 def _has_forward_jump(save: str) -> bool:
-    return any(
-        _has_exact_jump(line.strip(), "FORWARD", "DOCKER-USER")
-        for line in save.splitlines()
-    )
+    forward = _chain_rules(save, "FORWARD")
+    return bool(forward) and _has_exact_jump(forward[0], "FORWARD", "DOCKER-USER")
 
 
 def _check_family(observed_save: str, expected: dict[str, Any], family: str) -> list[str]:

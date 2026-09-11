@@ -50,7 +50,7 @@ For a dedicated FTP identity, set `ssh_platform: null` and `enabled_queries: []`
 
 The optional SNMP value must be a different secret from the target password, contain 3-255 printable UTF-8 bytes, and be omitted when SNMP is unused. There is no password fallback for SNMP.
 
-Never place credentials in the project directory, command line, logs, target policy, generated egress bundle, or source control. Password-backed records are a portability compromise. A dedicated secret broker and platform-appropriate key or certificate authentication would be preferable in a separately designed integration, but the stock proxy does not implement those alternatives.
+Never place credentials in the project directory, command line, logs, target policy, generated egress bundle, or source control. The runner password is never exported into the `ssh` process environment; the proxy hands it to its own askpass re-execution once over a private abstract socket. Password-backed records are a portability compromise. A dedicated secret broker and platform-appropriate key or certificate authentication would be preferable in a separately designed integration, but the stock proxy does not implement those alternatives.
 
 > SNMPv2c provides no encryption. Its community is transmitted in plaintext in UDP packets. Use a separate least-privilege read-only community, restrict UDP egress and device source ACLs, and prefer SNMPv3 when available.
 
@@ -155,7 +155,7 @@ See [Egress control](egress-control.md) for schema-3 generation, review, applica
 
 ## Rate limiting and snapshots
 
-Each proxy process enforces a per-target sliding window before forwarding. The default is 30 device calls per 60 seconds; `requests` is bounded to 1-60 and `window_seconds` to 1-3600. Rate state is process-local, not a distributed device quota.
+Each proxy process enforces a per-alias sliding window before forwarding; two vault aliases that point at the same host have separate windows. The default is 30 device calls per 60 seconds; `requests` is bounded to 1-60 and `window_seconds` to 1-3600. Rate state is process-local, not a distributed device quota.
 
 A valid `ssh_read` continuation with integer `offset > 0` does not consume another device rate slot because it must use an existing in-memory SSH snapshot. Every other device call consumes a slot. Expired or missing continuation state fails and must restart at offset 0.
 
