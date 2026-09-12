@@ -4,7 +4,7 @@ ARG APP_UID=65532
 ARG APP_GID=65532
 
 LABEL org.opencontainers.image.title="netops-helper" \
-      org.opencontainers.image.source="https://github.com/radek-cerny-soukr/netops-helper" \
+      org.opencontainers.image.source="https://github.com/radek-cerny-soukr/netops" \
       org.opencontainers.image.licenses="MIT"
 
 ENV PYTHONUNBUFFERED=1 \

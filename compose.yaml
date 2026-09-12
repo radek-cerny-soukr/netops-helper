@@ -3,7 +3,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: local/netops-helper:0.2.1
+    image: local/netops-helper:0.2.2
     container_name: netops-helper
     restart: unless-stopped
     read_only: true

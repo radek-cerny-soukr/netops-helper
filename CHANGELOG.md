@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.2.2 - 2026-09-12
+
+Release engineering release for the repository rename and the component tag scheme. No tool surface, query catalogue, policy schema, dependency, or runtime behaviour changes.
+
+### Release engineering and tests
+
+- Rename the repository to `radek-cerny-soukr/netops`; the old `netops-helper` URLs redirect. Update the OCI `org.opencontainers.image.source` label and its release test to the new URL.
+- Tag component releases as `netops-helper/v<version>` with the release title `netops-helper <version>`. The legacy tags `v0.1.0` to `v0.2.1` remain the netops-helper history and are never moved.
+
+### Fixes
+
+- Write the `.gitignore` entries for `vault.json`, `known_hosts`, and `.env` as real lines. They were committed as a single line containing literal `\n` sequences, so those ignore rules were never applied.
+
 ## 0.2.1 - 2026-09-11
 
 Hardening release driven by an independent code audit of 0.2.0. No tool surface, query catalogue, or policy schema changes; every finding was fixed with a regression test and verified in the ARM64 toolbox.

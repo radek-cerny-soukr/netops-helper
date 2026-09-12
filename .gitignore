@@ -10,4 +10,6 @@ config/container/certs/*.crt
 config/container/certs/*.pem
 config/container/ca/*.crt
 config/container/ca/*.pem
-\nvault.json\nknown_hosts\n.env\n
+vault.json
+known_hosts
+.env

@@ -172,7 +172,7 @@ def _replace_exact(path: Path, before: str, after: str) -> None:
 
 def _replace_current_changelog_heading(path: Path, version: str) -> None:
     text = path.read_text(encoding="utf-8")
-    pattern = re.compile(r"^## 0\.2\.1(?P<suffix> - [^\n]+)$", re.MULTILINE)
+    pattern = re.compile(r"^## 0\.2\.2(?P<suffix> - [^\n]+)$", re.MULTILINE)
     path.write_text(
         pattern.sub(lambda match: f"## {version}{match.group('suffix')}", text),
         encoding="utf-8",
@@ -219,7 +219,7 @@ def test_version_invariant_rejects_changed_pyproject(tmp_path: Path) -> None:
     root = _version_fixture(tmp_path)
     _replace_exact(
         root / "pyproject.toml",
-        "version = \"0.2.1\"",
+        "version = \"0.2.2\"",
         "version = \"not-a-release\"",
     )
     errors = _load_release_module("check_public_release")._version_invariant_errors(root)
@@ -232,8 +232,8 @@ def test_version_invariant_rejects_changed_package_version(tmp_path: Path) -> No
     root = _version_fixture(tmp_path)
     _replace_exact(
         root / "src/netops_helper/__init__.py",
-        "__version__ = \"0.2.1\"",
         "__version__ = \"0.2.2\"",
+        "__version__ = \"0.2.3\"",
     )
     errors = _load_release_module("check_public_release")._version_invariant_errors(root)
     assert "package __version__ does not match project metadata" in errors
@@ -247,7 +247,7 @@ def test_version_invariant_rejects_nested_and_function_version_bindings(
         "nested": "\nif True:\n    __version__ = \"9.9.9\"\n",
         "function": (
             "\ndef version_decoy():\n"
-            "    __version__ = \"0.2.1\"\n"
+            "    __version__ = \"0.2.2\"\n"
             "    return __version__\n"
         ),
     }
@@ -285,8 +285,8 @@ def test_version_invariant_rejects_changed_compose_image(tmp_path: Path) -> None
     root = _version_fixture(tmp_path)
     _replace_exact(
         root / "compose.yaml",
-        "image: local/netops-helper:0.2.1",
         "image: local/netops-helper:0.2.2",
+        "image: local/netops-helper:0.2.3",
     )
     errors = _load_release_module("check_public_release")._version_invariant_errors(root)
     assert "Compose netops-helper image label does not match project metadata" in errors
@@ -297,7 +297,7 @@ def test_version_invariant_rejects_manual_exporter_version(tmp_path: Path) -> No
     _replace_exact(
         root / "scripts/create_release_artifacts.py",
         "VERSION = project_version()",
-        "VERSION = \"0.2.1\"",
+        "VERSION = \"0.2.2\"",
     )
     errors = _load_release_module("check_public_release")._version_invariant_errors(root)
     assert "release exporter does not derive VERSION from project metadata" in errors
@@ -307,7 +307,7 @@ def test_version_invariant_rejects_changed_sbom_root(tmp_path: Path) -> None:
     root = _version_fixture(tmp_path)
     sbom_path = root / "sbom.cdx.json"
     sbom = json.loads(sbom_path.read_text(encoding="utf-8"))
-    sbom["metadata"]["component"]["version"] = "0.2.2"
+    sbom["metadata"]["component"]["version"] = "0.2.3"
     sbom_path.write_text(json.dumps(sbom), encoding="utf-8")
     errors = _load_release_module("check_public_release")._version_invariant_errors(root)
     assert "source SBOM root application metadata does not match project metadata" in errors
@@ -338,11 +338,11 @@ def test_version_invariant_ignores_backtick_fenced_heading_decoy(
     tmp_path: Path,
 ) -> None:
     root = _version_fixture(tmp_path)
-    _replace_current_changelog_heading(root / "CHANGELOG.md", "0.2.2")
+    _replace_current_changelog_heading(root / "CHANGELOG.md", "0.2.3")
     _replace_exact(
         root / "CHANGELOG.md",
         "# Changelog\n\n",
-        "# Changelog\n\n```md\n## 0.2.1 - fenced decoy\n```\n\n",
+        "# Changelog\n\n```md\n## 0.2.2 - fenced decoy\n```\n\n",
     )
     errors = _load_release_module("check_public_release")._version_invariant_errors(root)
     assert "changelog current release heading does not match project metadata" in errors
@@ -352,15 +352,15 @@ def test_version_invariant_respects_tilde_fence_closing_length(
     tmp_path: Path,
 ) -> None:
     root = _version_fixture(tmp_path)
-    _replace_current_changelog_heading(root / "CHANGELOG.md", "0.2.2")
+    _replace_current_changelog_heading(root / "CHANGELOG.md", "0.2.3")
     _replace_exact(
         root / "CHANGELOG.md",
         "# Changelog\n\n",
         (
             "# Changelog\n\n~~~~~markdown\n"
-            "## 0.2.1 - first fenced decoy\n"
+            "## 0.2.2 - first fenced decoy\n"
             "~~~~\n"
-            "## 0.2.1 - still fenced after short closer\n"
+            "## 0.2.2 - still fenced after short closer\n"
             "~~~~~~\n\n"
         ),
     )
@@ -373,14 +373,14 @@ def test_version_invariant_rejects_wrong_or_duplicate_changelog_heading(
 ) -> None:
     gate = _load_release_module("check_public_release")
     wrong = _version_fixture(tmp_path / "wrong")
-    _replace_current_changelog_heading(wrong / "CHANGELOG.md", "0.2.2")
+    _replace_current_changelog_heading(wrong / "CHANGELOG.md", "0.2.3")
     errors = gate._version_invariant_errors(wrong)
     assert "changelog current release heading does not match project metadata" in errors
 
     duplicate = _version_fixture(tmp_path / "duplicate")
     (duplicate / "CHANGELOG.md").write_text(
         (duplicate / "CHANGELOG.md").read_text(encoding="utf-8")
-        + "\n## 0.2.1 - misleading duplicate\n",
+        + "\n## 0.2.2 - misleading duplicate\n",
         encoding="utf-8",
     )
     errors = gate._version_invariant_errors(duplicate)
@@ -435,7 +435,7 @@ def test_public_allowlist_contains_all_0_2_contracts() -> None:
         for path in exporter.selected_files(ROOT)
     }
     assert len(selected) == 86
-    assert exporter.VERSION == "0.2.1"
+    assert exporter.VERSION == "0.2.2"
     assert required_tests <= exporter.TESTS
     assert required_tests <= gate.REQUIRED_RELEASE_PATHS
     assert dependency_free_required <= dependency_free_tests
@@ -466,7 +466,7 @@ def _public_source_fixture(tmp_path: Path) -> Path:
         check=True,
         text=True,
     )
-    exported = output / "netops-helper-0.2.1"
+    exported = output / "netops-helper-0.2.2"
     manifest = json.loads(
         (exported / "release-manifest.json").read_text(encoding="utf-8")
     )
@@ -624,7 +624,7 @@ def test_release_selection_rejects_unsafe_entries(tmp_path: Path) -> None:
 
 def test_release_export_preserves_existing_destination(tmp_path: Path) -> None:
     output = tmp_path / "existing-output"
-    destination = output / "netops-helper-0.2.1"
+    destination = output / "netops-helper-0.2.2"
     destination.mkdir(parents=True)
     marker = destination / "marker"
     marker_bytes = SELECTION_MARKER.encode("utf-8")
@@ -673,7 +673,7 @@ def test_release_export_rejects_symlinked_output(tmp_path: Path) -> None:
     parent_link.symlink_to(actual, target_is_directory=True)
 
     cases = {
-        "direct": (direct_link, actual / "netops-helper-0.2.1"),
+        "direct": (direct_link, actual / "netops-helper-0.2.2"),
         "parent": (
             parent_link / "nested-output",
             actual / "nested-output",
@@ -718,7 +718,7 @@ def test_release_gate_rejects_missing_vendor_contract(tmp_path: Path) -> None:
         ],
         check=True,
     )
-    exported = output / "netops-helper-0.2.1"
+    exported = output / "netops-helper-0.2.2"
     (exported / "release-manifest.json").unlink()
     gate = _load_release_module("check_public_release")
 
@@ -841,7 +841,7 @@ def test_release_tree_integrity_fails_closed(tmp_path: Path) -> None:
         ],
         check=True,
     )
-    exported = output / "netops-helper-0.2.1"
+    exported = output / "netops-helper-0.2.2"
     gate = _load_release_module("check_public_release")
     assert gate._release_tree_integrity_errors(exported) == []
 
@@ -1134,7 +1134,7 @@ def test_public_export_contains_no_python_bytecode(tmp_path: Path) -> None:
         ],
         check=True,
     )
-    exported = tmp_path / "netops-helper-0.2.1"
+    exported = tmp_path / "netops-helper-0.2.2"
     assert not [path for path in exported.rglob("*") if "__pycache__" in path.parts]
     assert not list(exported.rglob("*.pyc"))
     assert not list(exported.rglob("*.pyo"))
@@ -1144,7 +1144,7 @@ def test_runtime_image_drops_pip_and_carries_oci_labels() -> None:
     dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
     install = dockerfile.index("--require-hashes -r requirements.lock")
     assert dockerfile.index("python -m pip uninstall -y pip") > install
-    assert 'org.opencontainers.image.source="https://github.com/radek-cerny-soukr/netops-helper"' in dockerfile
+    assert 'org.opencontainers.image.source="https://github.com/radek-cerny-soukr/netops"' in dockerfile
     assert 'org.opencontainers.image.licenses="MIT"' in dockerfile
 
 
