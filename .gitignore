@@ -5,11 +5,6 @@ __pycache__/
 dist/
 build/
 *.egg-info/
-config/target-policy.json
-config/container/certs/*.crt
-config/container/certs/*.pem
-config/container/ca/*.crt
-config/container/ca/*.pem
 vault.json
 known_hosts
 .env

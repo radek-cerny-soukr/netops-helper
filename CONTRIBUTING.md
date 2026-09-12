@@ -1,5 +1,7 @@
 # Contributing
 
+This repository holds one component per directory under `components/`, each with its own version, gate, tests, and release. Work in the directory of the component you are changing; run its own checks there, and the repository gate `python3 scripts/check_release.py` from the root before proposing a change. A new component needs a release selector, a gate of its own, a `LICENSE` copy, and a CI job - the repository gate refuses a component that is missing any of them.
+
 Contributions are welcome when they preserve the fail-closed model.
 
 1. Open an issue describing the use case and threat impact before adding a new mutation profile.
